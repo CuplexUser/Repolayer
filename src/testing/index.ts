@@ -1,0 +1,741 @@
+import { describe, expect, it, afterAll } from 'vitest';
+
+import { defineSchema, type Schema } from '../core/schema.js';
+import { NotFoundError, QueryError, UniqueConstraintError } from '../core/errors.js';
+import type { Repo, TxContext } from '../core/repo.js';
+
+/**
+ * The shared conformance suite: the contract every adapter must satisfy.
+ *
+ * Both first-party adapters run exactly this file, which is what turns "the two backends
+ * behave identically" from a hope into something checked on every commit. It is exported
+ * as `repolayer/testing` so a third-party adapter can prove itself the same way.
+ */
+
+/** The model the suite exercises. Covers every field type and both nullability cases. */
+export const widgetSchema = defineSchema({
+  id: { type: 'string', primaryKey: true },
+  name: { type: 'string' },
+  slug: { type: 'string', unique: true },
+  quantity: { type: 'integer' },
+  weight: { type: 'number' },
+  active: { type: 'boolean' },
+  meta: { type: 'json', nullable: true },
+  releasedAt: { type: 'date', nullable: true, column: 'released_at' },
+  createdAt: { type: 'date', column: 'created_at' },
+  updatedAt: { type: 'date', column: 'updated_at' },
+});
+
+export interface Widget {
+  id: string;
+  name: string;
+  slug: string;
+  quantity: number;
+  weight: number;
+  active: boolean;
+  meta: unknown | null;
+  releasedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** A second model, used to prove two repos can share one transaction. */
+export const noteSchema = defineSchema({
+  id: { type: 'string', primaryKey: true },
+  body: { type: 'string' },
+});
+
+export interface Note {
+  id: string;
+  body: string;
+}
+
+/** Capability groups an adapter may declare unsupported, with a stated reason. */
+export type ConformanceCapability = 'transactions' | 'autoincrement';
+
+/** What the suite asks an adapter to build. Exported so adapters can annotate it. */
+export interface ConformanceRepoOptions {
+  schema: Schema;
+  table: string;
+  ids?: 'uuid' | 'autoincrement' | 'provided';
+  timestamps?: boolean;
+}
+
+export interface ConformanceAdapter {
+  /** Shown in test output, e.g. 'sqlite'. */
+  name: string;
+  /**
+   * Creates a repo over a fresh, isolated table. Called once per test, so the suite never
+   * depends on the order tests run in.
+   */
+  createRepo<T>(options: ConformanceRepoOptions): Promise<Repo<T>>;
+  /** Runs once after the whole suite. */
+  cleanup?(): Promise<void>;
+  /**
+   * Capabilities this engine genuinely cannot provide, each with a reason. Declaring one
+   * is a deliberate, visible statement, not a quiet skip: an adapter that simply fails
+   * these tests is broken, while one that declares them is documented.
+   */
+  unsupported?: Partial<Record<ConformanceCapability, string>>;
+}
+
+let tableCounter = 0;
+function uniqueTable(prefix: string): string {
+  tableCounter += 1;
+  return `${prefix}_${process.pid}_${tableCounter}`;
+}
+
+const baseWidget = (overrides: Partial<Widget> = {}): Partial<Widget> => ({
+  name: 'Anvil',
+  slug: `slug-${Math.random().toString(36).slice(2, 10)}`,
+  quantity: 3,
+  weight: 1.5,
+  active: true,
+  meta: null,
+  releasedAt: null,
+  ...overrides,
+});
+
+export function runConformanceSuite(adapter: ConformanceAdapter): void {
+  const unsupported = adapter.unsupported ?? {};
+
+  describe(`conformance: ${adapter.name}`, () => {
+    afterAll(async () => {
+      await adapter.cleanup?.();
+    });
+
+    /** Fresh repo per test, with the table already created. */
+    async function widgets(
+      options: { ids?: 'uuid' | 'autoincrement' | 'provided'; timestamps?: boolean } = {},
+    ): Promise<Repo<Widget>> {
+      return adapter.createRepo<Widget>({
+        schema: widgetSchema,
+        table: uniqueTable('widgets'),
+        ids: options.ids ?? 'uuid',
+        timestamps: options.timestamps ?? true,
+      });
+    }
+
+    // ------------------------------------------------------------------ CRUD
+
+    describe('crud', () => {
+      it('creates, reads, updates, and deletes a row', async () => {
+        const repo = await widgets();
+        const created = await repo.create(baseWidget({ name: 'Anvil' }));
+
+        expect(created.id).toBeTypeOf('string');
+        expect(created.name).toBe('Anvil');
+
+        const found = await repo.findById(created.id);
+        expect(found).toEqual(created);
+
+        const updated = await repo.update(created.id, { name: 'Hammer' });
+        expect(updated.name).toBe('Hammer');
+        expect(updated.id).toBe(created.id);
+
+        await repo.delete(created.id);
+        expect(await repo.findById(created.id)).toBeNull();
+      });
+
+      it('returns null rather than throwing for a missing id', async () => {
+        const repo = await widgets();
+        expect(await repo.findById('does-not-exist')).toBeNull();
+      });
+
+      it('throws NotFoundError when updating a missing row', async () => {
+        const repo = await widgets();
+        await expect(repo.update('missing', { name: 'x' })).rejects.toBeInstanceOf(NotFoundError);
+      });
+
+      it('throws NotFoundError when deleting a missing row', async () => {
+        const repo = await widgets();
+        await expect(repo.delete('missing')).rejects.toBeInstanceOf(NotFoundError);
+      });
+
+      it('applies a partial update without disturbing other fields', async () => {
+        const repo = await widgets();
+        const created = await repo.create(baseWidget({ name: 'A', quantity: 7, weight: 2.5 }));
+        const updated = await repo.update(created.id, { quantity: 9 });
+
+        expect(updated.quantity).toBe(9);
+        expect(updated.name).toBe('A');
+        expect(updated.weight).toBe(2.5);
+      });
+
+      it('creates many rows in one call', async () => {
+        const repo = await widgets();
+        const created = await repo.createMany([
+          baseWidget({ name: 'A' }),
+          baseWidget({ name: 'B' }),
+          baseWidget({ name: 'C' }),
+        ]);
+        expect(created).toHaveLength(3);
+        expect(new Set(created.map((w) => w.id)).size).toBe(3);
+        expect(await repo.count()).toBe(3);
+      });
+
+      it('deletes many rows by filter and reports how many went', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ active: true }),
+          baseWidget({ active: true }),
+          baseWidget({ active: false }),
+        ]);
+
+        const removed = await repo.deleteMany({
+          where: [{ field: 'active', op: 'eq', value: true }],
+        });
+        expect(removed).toBe(2);
+        expect(await repo.count()).toBe(1);
+
+        expect(await repo.deleteMany()).toBe(1);
+        expect(await repo.count()).toBe(0);
+      });
+
+      it('treats createMany([]) as a no-op', async () => {
+        const repo = await widgets();
+        expect(await repo.createMany([])).toEqual([]);
+        expect(await repo.count()).toBe(0);
+      });
+    });
+
+    // ------------------------------------------------------- type round trips
+
+    describe('type round trips', () => {
+      it('round trips booleans as booleans', async () => {
+        const repo = await widgets();
+        const on = await repo.create(baseWidget({ active: true }));
+        const off = await repo.create(baseWidget({ active: false }));
+
+        expect(on.active).toBe(true);
+        expect(off.active).toBe(false);
+        expect((await repo.findById(off.id))?.active).toBe(false);
+      });
+
+      it('round trips dates as Date objects, preserving milliseconds and UTC', async () => {
+        const repo = await widgets();
+        const released = new Date('2024-03-05T06:07:08.123Z');
+        const created = await repo.create(baseWidget({ releasedAt: released }));
+
+        expect(created.releasedAt).toBeInstanceOf(Date);
+        expect(created.releasedAt?.toISOString()).toBe(released.toISOString());
+        expect((await repo.findById(created.id))?.releasedAt?.getTime()).toBe(released.getTime());
+      });
+
+      it('round trips nested json, including arrays and embedded nulls', async () => {
+        const repo = await widgets();
+        const meta = { tags: ['a', 'b'], nested: { n: 1, missing: null }, list: [1, 2, 3] };
+        const created = await repo.create(baseWidget({ meta }));
+
+        expect(created.meta).toEqual(meta);
+        expect((await repo.findById(created.id))?.meta).toEqual(meta);
+      });
+
+      it('round trips a json value that is itself a string', async () => {
+        // The tempting shortcut of JSON.parse-ing every result would corrupt this one.
+        const repo = await widgets();
+        const created = await repo.create(baseWidget({ meta: 'plain string' }));
+        expect((await repo.findById(created.id))?.meta).toBe('plain string');
+      });
+
+      it('distinguishes null from absent for a nullable field', async () => {
+        const repo = await widgets();
+        const created = await repo.create(baseWidget({ releasedAt: null, meta: null }));
+        expect(created.releasedAt).toBeNull();
+        expect(created.meta).toBeNull();
+      });
+
+      it('round trips empty strings, zero, and negative numbers', async () => {
+        const repo = await widgets();
+        const created = await repo.create(
+          baseWidget({ name: '', quantity: 0, weight: -2.25, active: false }),
+        );
+        const found = await repo.findById(created.id);
+
+        expect(found?.name).toBe('');
+        expect(found?.quantity).toBe(0);
+        expect(found?.weight).toBe(-2.25);
+      });
+
+      it('round trips large integers up to the safe range', async () => {
+        const repo = await widgets();
+        const created = await repo.create(baseWidget({ quantity: Number.MAX_SAFE_INTEGER }));
+        expect((await repo.findById(created.id))?.quantity).toBe(Number.MAX_SAFE_INTEGER);
+      });
+
+      it('rejects a value whose type does not match the schema', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.create(baseWidget({ quantity: 'seven' as unknown as number })),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
+    // ------------------------------------------------------------------ filters
+
+    describe('filters', () => {
+      async function seeded(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ name: 'Anvil', slug: 'a', quantity: 1, active: true }),
+          baseWidget({ name: 'anvil', slug: 'b', quantity: 5, active: false }),
+          baseWidget({ name: 'Barrel', slug: 'c', quantity: 10, active: true }),
+          baseWidget({ name: 'Crate', slug: 'd', quantity: 10, active: false, meta: { x: 1 } }),
+        ]);
+        return repo;
+      }
+
+      it('supports the object form of where as an implicit AND of equality', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({ where: { quantity: 10, active: true } });
+        expect(rows.map((r) => r.name)).toEqual(['Barrel']);
+      });
+
+      it('supports eq, ne, gt, gte, lt, lte', async () => {
+        const repo = await seeded();
+        const names = async (filter: Parameters<typeof repo.findMany>[0]): Promise<string[]> =>
+          (await repo.findMany(filter)).map((r) => r.slug).sort();
+
+        expect(await names({ where: [{ field: 'quantity', op: 'eq', value: 10 }] })).toEqual([
+          'c',
+          'd',
+        ]);
+        expect(await names({ where: [{ field: 'quantity', op: 'ne', value: 10 }] })).toEqual([
+          'a',
+          'b',
+        ]);
+        expect(await names({ where: [{ field: 'quantity', op: 'gt', value: 5 }] })).toEqual([
+          'c',
+          'd',
+        ]);
+        expect(await names({ where: [{ field: 'quantity', op: 'gte', value: 5 }] })).toEqual([
+          'b',
+          'c',
+          'd',
+        ]);
+        expect(await names({ where: [{ field: 'quantity', op: 'lt', value: 5 }] })).toEqual(['a']);
+        expect(await names({ where: [{ field: 'quantity', op: 'lte', value: 5 }] })).toEqual([
+          'a',
+          'b',
+        ]);
+      });
+
+      it('ANDs multiple filters together', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [
+            { field: 'quantity', op: 'gte', value: 5 },
+            { field: 'active', op: 'eq', value: false },
+          ],
+        });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['b', 'd']);
+      });
+
+      it('supports in and nin', async () => {
+        const repo = await seeded();
+        const inRows = await repo.findMany({
+          where: [{ field: 'slug', op: 'in', value: ['a', 'c'] }],
+        });
+        expect(inRows.map((r) => r.slug).sort()).toEqual(['a', 'c']);
+
+        const ninRows = await repo.findMany({
+          where: [{ field: 'slug', op: 'nin', value: ['a', 'c'] }],
+        });
+        expect(ninRows.map((r) => r.slug).sort()).toEqual(['b', 'd']);
+      });
+
+      it('treats an empty in as matching nothing and an empty nin as matching everything', async () => {
+        const repo = await seeded();
+        expect(await repo.findMany({ where: [{ field: 'slug', op: 'in', value: [] }] })).toEqual(
+          [],
+        );
+        expect(
+          (await repo.findMany({ where: [{ field: 'slug', op: 'nin', value: [] }] })).length,
+        ).toBe(4);
+      });
+
+      it('keeps null rows in a ne result', async () => {
+        // Raw SQL would drop them, since NULL <> 'x' is NULL rather than true.
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [{ field: 'meta', op: 'ne', value: { x: 2 } }],
+        });
+        expect(rows.length).toBe(4);
+      });
+
+      it('supports isNull in both directions', async () => {
+        const repo = await seeded();
+        const nulls = await repo.findMany({ where: [{ field: 'meta', op: 'isNull' }] });
+        expect(nulls.map((r) => r.slug).sort()).toEqual(['a', 'b', 'c']);
+
+        const notNull = await repo.findMany({
+          where: [{ field: 'meta', op: 'isNull', value: false }],
+        });
+        expect(notNull.map((r) => r.slug)).toEqual(['d']);
+      });
+
+      it('makes like case sensitive on every engine', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({ where: [{ field: 'name', op: 'like', value: 'A%' }] });
+        expect(rows.map((r) => r.slug)).toEqual(['a']);
+      });
+
+      it('makes ilike case insensitive on every engine', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({ where: [{ field: 'name', op: 'ilike', value: 'a%' }] });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['a', 'b']);
+      });
+
+      it('treats an underscore in a like pattern as a single-character wildcard', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ name: 'ab', slug: 'p' }),
+          baseWidget({ name: 'axb', slug: 'q' }),
+          baseWidget({ name: 'axxb', slug: 'r' }),
+        ]);
+        const rows = await repo.findMany({ where: [{ field: 'name', op: 'like', value: 'a_b' }] });
+        expect(rows.map((r) => r.slug)).toEqual(['q']);
+      });
+
+      it('rejects a non-array value for in', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.findMany({ where: [{ field: 'slug', op: 'in', value: 'a' }] }),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
+    // --------------------------------------------------------- ordering, paging
+
+    describe('ordering and paging', () => {
+      async function ordered(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ slug: 'a', quantity: 2, name: 'x' }),
+          baseWidget({ slug: 'b', quantity: 1, name: 'y' }),
+          baseWidget({ slug: 'c', quantity: 2, name: 'a' }),
+          baseWidget({ slug: 'd', quantity: 3, name: 'z' }),
+        ]);
+        return repo;
+      }
+
+      it('orders by a single key in both directions', async () => {
+        const repo = await ordered();
+        const asc = await repo.findMany({ orderBy: [{ field: 'slug', direction: 'asc' }] });
+        expect(asc.map((r) => r.slug)).toEqual(['a', 'b', 'c', 'd']);
+
+        const desc = await repo.findMany({ orderBy: [{ field: 'slug', direction: 'desc' }] });
+        expect(desc.map((r) => r.slug)).toEqual(['d', 'c', 'b', 'a']);
+      });
+
+      it('orders by multiple keys in order of precedence', async () => {
+        const repo = await ordered();
+        const rows = await repo.findMany({
+          orderBy: [
+            { field: 'quantity', direction: 'asc' },
+            { field: 'name', direction: 'asc' },
+          ],
+        });
+        expect(rows.map((r) => r.slug)).toEqual(['b', 'c', 'a', 'd']);
+      });
+
+      it('places nulls last on asc and first on desc, identically on every engine', async () => {
+        // Left to their defaults the engines disagree here, so this is the case that
+        // actually proves the normalization is doing something.
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ slug: 'has-1', releasedAt: new Date('2024-01-01T00:00:00.000Z') }),
+          baseWidget({ slug: 'null-1', releasedAt: null }),
+          baseWidget({ slug: 'has-2', releasedAt: new Date('2023-01-01T00:00:00.000Z') }),
+          baseWidget({ slug: 'null-2', releasedAt: null }),
+        ]);
+
+        const asc = await repo.findMany({ orderBy: [{ field: 'releasedAt', direction: 'asc' }] });
+        expect(asc.slice(0, 2).map((r) => r.slug)).toEqual(['has-2', 'has-1']);
+        expect(asc.slice(2).every((r) => r.releasedAt === null)).toBe(true);
+
+        const desc = await repo.findMany({
+          orderBy: [{ field: 'releasedAt', direction: 'desc' }],
+        });
+        expect(desc.slice(0, 2).every((r) => r.releasedAt === null)).toBe(true);
+        expect(desc.slice(2).map((r) => r.slug)).toEqual(['has-1', 'has-2']);
+      });
+
+      it('supports limit, offset, and offset without limit', async () => {
+        const repo = await ordered();
+        const order = [{ field: 'slug' as const, direction: 'asc' as const }];
+
+        expect((await repo.findMany({ orderBy: order, limit: 2 })).map((r) => r.slug)).toEqual([
+          'a',
+          'b',
+        ]);
+        expect(
+          (await repo.findMany({ orderBy: order, limit: 2, offset: 1 })).map((r) => r.slug),
+        ).toEqual(['b', 'c']);
+        expect((await repo.findMany({ orderBy: order, offset: 2 })).map((r) => r.slug)).toEqual([
+          'c',
+          'd',
+        ]);
+      });
+
+      it('pages through the whole set without gaps or repeats', async () => {
+        const repo = await ordered();
+        const order = [{ field: 'slug' as const, direction: 'asc' as const }];
+        const seen: string[] = [];
+        for (let offset = 0; offset < 4; offset += 2) {
+          const page = await repo.findMany({ orderBy: order, limit: 2, offset });
+          seen.push(...page.map((r) => r.slug));
+        }
+        expect(seen).toEqual(['a', 'b', 'c', 'd']);
+      });
+
+      it('returns the first row from findOne, honoring order', async () => {
+        const repo = await ordered();
+        const row = await repo.findOne({ orderBy: [{ field: 'slug', direction: 'desc' }] });
+        expect(row?.slug).toBe('d');
+        expect(await (await widgets()).findOne()).toBeNull();
+      });
+
+      it('rejects a negative limit', async () => {
+        const repo = await widgets();
+        await expect(repo.findMany({ limit: -1 })).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
+    // ------------------------------------------------------------------- count
+
+    describe('count', () => {
+      it('counts with and without a filter, agreeing with findMany', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ active: true }),
+          baseWidget({ active: true }),
+          baseWidget({ active: false }),
+        ]);
+
+        expect(await repo.count()).toBe(3);
+        const filter = { where: [{ field: 'active' as const, op: 'eq' as const, value: true }] };
+        expect(await repo.count(filter)).toBe(2);
+        expect(await repo.count(filter)).toBe((await repo.findMany(filter)).length);
+      });
+
+      it('counts zero on an empty table', async () => {
+        expect(await (await widgets()).count()).toBe(0);
+      });
+    });
+
+    // -------------------------------------------------------------- constraints
+
+    describe('constraints', () => {
+      it('throws UniqueConstraintError naming the offending field', async () => {
+        const repo = await widgets();
+        await repo.create(baseWidget({ slug: 'taken' }));
+
+        const error = await repo.create(baseWidget({ slug: 'taken' })).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(UniqueConstraintError);
+        expect((error as UniqueConstraintError).fields).toContain('slug');
+      });
+    });
+
+    // ------------------------------------------------------- ids and timestamps
+
+    describe('ids and timestamps', () => {
+      it('generates a uuid when none is supplied', async () => {
+        const repo = await widgets({ ids: 'uuid' });
+        const created = await repo.create(baseWidget());
+        expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      });
+
+      it('honors a caller-supplied id under the provided strategy', async () => {
+        const repo = await widgets({ ids: 'provided' });
+        const created = await repo.create(baseWidget({ id: 'chosen-id' }));
+        expect(created.id).toBe('chosen-id');
+        expect((await repo.findById('chosen-id'))?.id).toBe('chosen-id');
+      });
+
+      it('requires an id under the provided strategy', async () => {
+        const repo = await widgets({ ids: 'provided' });
+        await expect(repo.create(baseWidget())).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('sets createdAt once and advances updatedAt on write', async () => {
+        const repo = await widgets({ timestamps: true });
+        const created = await repo.create(baseWidget());
+
+        expect(created.createdAt).toBeInstanceOf(Date);
+        expect(created.updatedAt.getTime()).toBe(created.createdAt.getTime());
+
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const updated = await repo.update(created.id, { name: 'changed' });
+
+        expect(updated.createdAt.getTime()).toBe(created.createdAt.getTime());
+        expect(updated.updatedAt.getTime()).toBeGreaterThan(created.updatedAt.getTime());
+      });
+    });
+
+    // ------------------------------------------------------------------- errors
+
+    describe('query errors', () => {
+      it('rejects an unknown field in where before touching the database', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.findMany({ where: [{ field: 'nope' as keyof Widget & string, op: 'eq', value: 1 }] }),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects an unknown field in orderBy', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.findMany({ orderBy: [{ field: 'nope' as keyof Widget & string, direction: 'asc' }] }),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects an unknown operator', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.findMany({
+            where: [{ field: 'name', op: 'regex' as 'eq', value: 'x' }],
+          }),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects an unknown field on create', async () => {
+        const repo = await widgets();
+        await expect(
+          repo.create({ ...baseWidget(), bogus: 1 } as Partial<Widget>),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
+    // ------------------------------------------------------------- transactions
+
+    const txReason = unsupported.transactions;
+    const describeTx = txReason ? describe.skip : describe;
+
+    if (txReason) {
+      it(`declares transactions unsupported: ${txReason}`, () => {
+        expect(txReason).toBeTypeOf('string');
+      });
+    }
+
+    describeTx('transactions', () => {
+      it('commits when the callback returns', async () => {
+        const repo = await widgets();
+        const created = await repo.withTransaction(async (tx) => tx.create(baseWidget()));
+        expect(await repo.findById(created.id)).not.toBeNull();
+      });
+
+      it('returns the callback value', async () => {
+        const repo = await widgets();
+        expect(await repo.withTransaction(async () => 42)).toBe(42);
+      });
+
+      it('rolls back everything when the callback throws', async () => {
+        const repo = await widgets();
+        const boom = new Error('boom');
+
+        await expect(
+          repo.withTransaction(async (tx) => {
+            await tx.create(baseWidget());
+            await tx.create(baseWidget());
+            throw boom;
+          }),
+        ).rejects.toBe(boom);
+
+        expect(await repo.count()).toBe(0);
+      });
+
+      it('leaves work committed before the transaction untouched', async () => {
+        const repo = await widgets();
+        const before = await repo.create(baseWidget());
+
+        await repo
+          .withTransaction(async (tx) => {
+            await tx.create(baseWidget());
+            throw new Error('nope');
+          })
+          .catch(() => undefined);
+
+        expect(await repo.count()).toBe(1);
+        expect(await repo.findById(before.id)).not.toBeNull();
+      });
+
+      it('rolls back a nested savepoint without losing the outer transaction', async () => {
+        const repo = await widgets();
+
+        const outer = await repo.withTransaction(async (tx) => {
+          const kept = await tx.create(baseWidget({ slug: 'kept' }));
+
+          await tx
+            .withTransaction(async (inner) => {
+              await inner.create(baseWidget({ slug: 'discarded' }));
+              throw new Error('inner failure');
+            })
+            .catch(() => undefined);
+
+          return kept;
+        });
+
+        const rows = await repo.findMany();
+        expect(rows.map((r) => r.slug)).toEqual(['kept']);
+        expect(outer.slug).toBe('kept');
+      });
+
+      it('commits a nested savepoint along with its parent', async () => {
+        const repo = await widgets();
+        await repo.withTransaction(async (tx) => {
+          await tx.create(baseWidget({ slug: 'outer' }));
+          await tx.withTransaction(async (inner) => {
+            await inner.create(baseWidget({ slug: 'inner' }));
+          });
+        });
+        expect((await repo.findMany()).map((r) => r.slug).sort()).toEqual(['inner', 'outer']);
+      });
+
+      it('lets a second repo join the same transaction via with(ctx)', async () => {
+        const table = uniqueTable('widgets');
+        const widgetRepo = await adapter.createRepo<Widget>({
+          schema: widgetSchema,
+          table,
+          timestamps: true,
+        });
+        const noteRepo = await adapter.createRepo<Note>({
+          schema: noteSchema,
+          table: uniqueTable('notes'),
+        });
+
+        await expect(
+          widgetRepo.withTransaction(async (tx, ctx: TxContext) => {
+            await tx.create(baseWidget());
+            await noteRepo.with(ctx).create({ body: 'note' });
+            throw new Error('roll it all back');
+          }),
+        ).rejects.toThrow('roll it all back');
+
+        // Both repos must be rolled back, which only happens if they truly shared one
+        // connection rather than each opening their own.
+        expect(await widgetRepo.count()).toBe(0);
+        expect(await noteRepo.count()).toBe(0);
+      });
+
+      it('sees its own uncommitted writes inside the transaction', async () => {
+        const repo = await widgets();
+        await repo.withTransaction(async (tx) => {
+          const created = await tx.create(baseWidget());
+          expect(await tx.findById(created.id)).not.toBeNull();
+          expect(await tx.count()).toBe(1);
+        });
+      });
+
+      it('stays usable after a rolled-back transaction', async () => {
+        const repo = await widgets();
+        await repo.withTransaction(async () => {
+          throw new Error('fail');
+        }).catch(() => undefined);
+
+        const created = await repo.create(baseWidget());
+        expect(await repo.findById(created.id)).not.toBeNull();
+      });
+    });
+  });
+}

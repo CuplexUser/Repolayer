@@ -1,0 +1,96 @@
+{
+  "name": "repolayer",
+  "version": "0.1.0",
+  "description": "A thin repository abstraction: write your data access once, swap SQLite for Postgres later.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "ROADMAP.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./sqlite": {
+      "import": {
+        "types": "./dist/sqlite/index.d.ts",
+        "default": "./dist/sqlite/index.js"
+      },
+      "require": {
+        "types": "./dist/sqlite/index.d.cts",
+        "default": "./dist/sqlite/index.cjs"
+      }
+    },
+    "./postgres": {
+      "import": {
+        "types": "./dist/postgres/index.d.ts",
+        "default": "./dist/postgres/index.js"
+      },
+      "require": {
+        "types": "./dist/postgres/index.d.cts",
+        "default": "./dist/postgres/index.cjs"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing/index.d.ts",
+        "default": "./dist/testing/index.js"
+      },
+      "require": {
+        "types": "./dist/testing/index.d.cts",
+        "default": "./dist/testing/index.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "pg:up": "docker compose up -d --wait",
+    "pg:down": "docker compose down -v",
+    "test:pg": "npm run pg:up && node scripts/test-pg.mjs",
+    "example:swap": "npm run build && node --experimental-strip-types examples/swap/index.ts"
+  },
+  "keywords": [
+    "repository",
+    "sqlite",
+    "postgres",
+    "database",
+    "abstraction",
+    "adapter"
+  ],
+  "peerDependencies": {
+    "pg": "^8.11.0",
+    "vitest": ">=1"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.1",
+    "tsdown": "^0.9.6",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

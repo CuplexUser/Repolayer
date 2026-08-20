@@ -1,0 +1,15 @@
+# Postgres for `npm run test:pg`. Port 54329 avoids colliding with a local 5432.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: repolayer
+      POSTGRES_PASSWORD: repolayer
+      POSTGRES_DB: repolayer
+    ports:
+      - '54329:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U repolayer -d repolayer']
+      interval: 1s
+      timeout: 3s
+      retries: 30
