@@ -58,6 +58,12 @@ jobs:
 
       - run: npm ci
 
+      - name: Build
+        # Must precede the typecheck: examples/swap imports the built package from dist/
+        # on purpose, so that the example also verifies the generated .d.ts files are
+        # usable. On a clean runner there is no dist/ until this step runs.
+        run: npm run build
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -81,9 +87,6 @@ jobs:
             }
             console.log('Postgres conformance:', passed + '/' + total, 'passed');
           "
-
-      - name: Build
-        run: npm run build
 
       - name: Prove the driver swap produces identical output
         # The package's central claim, executed against both engines for real.
