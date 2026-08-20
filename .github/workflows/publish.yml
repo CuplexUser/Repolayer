@@ -1,0 +1,117 @@
+name: Publish
+
+# Two triggers, because either habit is reasonable:
+#   - push a tag:      git tag v0.2.0 && git push origin v0.2.0
+#   - publish a GitHub Release (which also carries a tag)
+# Doing both for one version is harmless: the second run finds the version already on npm
+# and exits without republishing.
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+# Never publish the same version twice concurrently.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The full CI suite, including the Postgres conformance tests, must pass before anything
+  # reaches npm. Reusing ci.yml means the release gate can never drift from the branch gate.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Required for npm provenance: this is what lets the runner mint the OIDC token that
+      # npm verifies to attest where the package was built. Without it, --provenance fails.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Upgrade npm
+        # Trusted publishing (OIDC) needs npm 11.5.1 or newer. The npm bundled with a
+        # given Node release can be older, and the failure mode is opaque: npm silently
+        # falls back to looking for a token that does not exist. Pinning to latest here
+        # avoids depending on whatever happened to ship with Node 24.
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Check the tag matches the version in package.json
+        # Catches the classic mistake of tagging v0.2.0 while package.json still says
+        # 0.1.0, which would otherwise publish the wrong version under the right tag.
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VERSION="${TAG#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag: $TAG_VERSION, package.json: $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $TAG does not match package.json version $PKG_VERSION."
+            exit 1
+          fi
+
+      - name: Skip if this version is already on npm
+        id: published
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME@$VERSION is already published. Nothing to do."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm ci
+        if: steps.published.outputs.already == 'false'
+
+      - run: npm run build
+        if: steps.published.outputs.already == 'false'
+
+      - name: Publish with provenance
+        if: steps.published.outputs.already == 'false'
+        # Authenticated by trusted publishing: npm exchanges the OIDC token minted by the
+        # `id-token: write` permission above for a short-lived, single-publish credential.
+        # There is no NPM_TOKEN secret to leak, rotate, or accidentally scope too widely.
+        #
+        # This requires a Trusted Publisher configured on the npm package page
+        # (npmjs.com/package/repolayer/access) naming this repo and this workflow file.
+        # Renaming this file breaks the match and publishing will start failing.
+        #
+        # To fall back to a granular access token instead, add back:
+        #   env:
+        #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # and give that token "Bypass 2FA", since CI cannot answer an OTP prompt.
+        run: npm publish --provenance --access public
+
+      - name: Summarize
+        if: steps.published.outputs.already == 'false'
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          {
+            echo "### Published repolayer@$VERSION"
+            echo ""
+            echo "https://www.npmjs.com/package/repolayer/v/$VERSION"
+            echo ""
+            echo "Built with provenance from \`${GITHUB_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,8 @@
 # repolayer
 
+[![CI](https://github.com/CuplexUser/Repolayer/actions/workflows/ci.yml/badge.svg)](https://github.com/CuplexUser/Repolayer/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/repolayer.svg)](https://www.npmjs.com/package/repolayer)
+
 Define your data access once against a plain interface, and swap the storage engine
 underneath without touching application code.
 
@@ -228,7 +231,33 @@ npm run example:swap  # runs the same logic on both drivers and diffs the output
 ```
 
 `npm test` runs everything that needs no external service. The Postgres conformance tests
-skip with a message unless `TEST_DATABASE_URL` is set.
+skip with a message unless `TEST_DATABASE_URL` is set. CI always sets it, against a
+Postgres service container, and fails the build if that half of the suite skips, so
+"passing" never quietly means SQLite only.
+
+## Releasing
+
+Publishing is automated. Do not run `npm publish` by hand.
+
+1. Bump the version and commit it: `npm version patch` (or `minor` / `major`), which also
+   creates the matching `vX.Y.Z` tag.
+2. Push the commit and the tag: `git push --follow-tags`.
+
+Pushing the tag, or publishing a GitHub Release, triggers `.github/workflows/publish.yml`.
+It runs the full CI suite including the Postgres conformance tests, checks the tag against
+`package.json`, and only then publishes with `npm publish --provenance`. The provenance
+attestation is what produces the verified build-source badge on the npm page: it links the
+published tarball to this repository, this commit, and the workflow that built it.
+
+Authentication uses npm **trusted publishing**, so there is no `NPM_TOKEN` secret in this
+repository. npm mints a short-lived, single-publish credential from the workflow's OIDC
+identity. This depends on a Trusted Publisher configured on the npm package page
+(Settings tab, or `npmjs.com/package/repolayer/access`) naming this repository and the
+`publish.yml` workflow file. **Renaming that workflow file breaks the match** and publishes
+will start failing until the npm-side configuration is updated to match.
+
+Doing both (pushing a tag and cutting a Release from it) is safe. The second run notices
+the version is already on npm and exits without republishing.
 
 ## License
 

@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+# A newer push to the same branch cancels the older run, except on main where every
+# commit's result is worth keeping.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # `node:sqlite` needs --experimental-sqlite below 23.4 and is only stable from 24,
+        # so the SQLite adapter is exercised on 24 and up. The core and Postgres paths run
+        # fine on older releases, which is what engines.node reflects.
+        node: ['24', '26']
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: repolayer
+          POSTGRES_PASSWORD: repolayer
+          POSTGRES_DB: repolayer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U repolayer -d repolayer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Setting this is what un-skips the Postgres half of the conformance suite. Locally
+      # it is usually absent and those tests skip with a message; in CI they always run.
+      TEST_DATABASE_URL: postgres://repolayer:repolayer@localhost:5432/repolayer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (unit, SQLite conformance, and Postgres conformance)
+        run: npx vitest run
+
+      - name: Fail if the Postgres conformance suite did not actually run
+        # The suite skips itself when TEST_DATABASE_URL is missing. A silent skip in CI
+        # would quietly reduce this to SQLite-only coverage, which is exactly the failure
+        # this workflow exists to prevent.
+        run: |
+          npx vitest run test/postgres.test.ts --reporter=json --outputFile=pg-report.json
+          node -e "
+            const fs = require('node:fs');
+            const r = JSON.parse(fs.readFileSync('pg-report.json', 'utf8'));
+            const total = r.numTotalTests ?? 0;
+            const passed = r.numPassedTests ?? 0;
+            if (total === 0 || passed === 0) {
+              console.error('Postgres conformance suite did not run. Check TEST_DATABASE_URL.');
+              process.exit(1);
+            }
+            console.log('Postgres conformance:', passed + '/' + total, 'passed');
+          "
+
+      - name: Build
+        run: npm run build
+
+      - name: Prove the driver swap produces identical output
+        # The package's central claim, executed against both engines for real.
+        run: node --experimental-strip-types examples/swap/index.ts
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Pack and install into a scratch consumer
+        # Catches export-map and type-resolution breakage that only shows up once the
+        # package is installed, and confirms the SQLite path works with `pg` absent.
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination /tmp
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          echo '{"name":"consumer","private":true,"type":"module","version":"1.0.0"}' > package.json
+          npm install /tmp/repolayer-*.tgz
+
+          cat > esm.mjs <<'EOF'
+          import { createRepo, defineSchema } from 'repolayer';
+          import { SqliteRepo } from 'repolayer/sqlite';
+          import assert from 'node:assert/strict';
+          const schema = defineSchema({
+            id: { type: 'string', primaryKey: true },
+            name: { type: 'string' },
+          });
+          const repo = await createRepo({
+            driver: 'sqlite', table: 't', schema,
+            connection: { file: ':memory:' }, ensureTable: true,
+          });
+          const row = await repo.create({ name: 'esm' });
+          assert.equal((await repo.findById(row.id)).name, 'esm');
+          assert.equal(typeof SqliteRepo, 'function');
+          await repo.close();
+          console.log('ESM consumer ok');
+          EOF
+
+          cat > cjs.cjs <<'EOF'
+          const assert = require('node:assert/strict');
+          const { createRepo, defineSchema } = require('repolayer');
+          const schema = defineSchema({
+            id: { type: 'string', primaryKey: true },
+            name: { type: 'string' },
+          });
+          createRepo({
+            driver: 'sqlite', table: 't', schema,
+            connection: { file: ':memory:' }, ensureTable: true,
+          }).then(async (repo) => {
+            const row = await repo.create({ name: 'cjs' });
+            assert.equal((await repo.findById(row.id)).name, 'cjs');
+            await repo.close();
+            console.log('CJS consumer ok');
+          }).catch((e) => { console.error(e); process.exit(1); });
+          EOF
+
+          node esm.mjs
+          node cjs.cjs
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: /tmp/repolayer-*.tgz

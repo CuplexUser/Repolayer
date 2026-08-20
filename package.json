@@ -2,8 +2,24 @@
   "name": "repolayer",
   "version": "0.1.0",
   "description": "A thin repository abstraction: write your data access once, swap SQLite for Postgres later.",
-  "type": "module",
+  "keywords": [
+    "repository",
+    "sqlite",
+    "postgres",
+    "database",
+    "abstraction",
+    "adapter"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CuplexUser/Repolayer.git"
+  },
+  "homepage": "https://github.com/CuplexUser/Repolayer#readme",
+  "bugs": {
+    "url": "https://github.com/CuplexUser/Repolayer/issues"
+  },
+  "type": "module",
   "engines": {
     "node": ">=22.5.0"
   },
@@ -63,16 +79,9 @@
     "pg:up": "docker compose up -d --wait",
     "pg:down": "docker compose down -v",
     "test:pg": "npm run pg:up && node scripts/test-pg.mjs",
-    "example:swap": "npm run build && node --experimental-strip-types examples/swap/index.ts"
+    "example:swap": "npm run build && node --experimental-strip-types examples/swap/index.ts",
+    "prepublishOnly": "npm run build"
   },
-  "keywords": [
-    "repository",
-    "sqlite",
-    "postgres",
-    "database",
-    "abstraction",
-    "adapter"
-  ],
   "peerDependencies": {
     "pg": "^8.11.0",
     "vitest": ">=1"
