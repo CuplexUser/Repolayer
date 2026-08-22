@@ -64,8 +64,16 @@ async function exerciseRepo(repo: Repo<Puzzle>): Promise<string> {
   const ilikeRows = await repo.findMany({ where: [{ field: 'title', op: 'ilike', value: 'N%' }] });
   lines.push(`ilike N%: ${ilikeRows.map((p) => p.title).join(',')}`);
 
-  // Null ordering is normalized, so the two engines agree on where the nulls land.
-  const ordered = await repo.findMany({ orderBy: [{ field: 'solvedAt', direction: 'asc' }] });
+  // Null ordering is normalized, so the two engines agree on where the nulls land. `title`
+  // breaks the tie between the two rows that have no solvedAt: findMany appends no key of
+  // its own, so without it those two come back in whatever order the engine happened to
+  // read them, which is not the same order on every engine or even on every run.
+  const ordered = await repo.findMany({
+    orderBy: [
+      { field: 'solvedAt', direction: 'asc' },
+      { field: 'title', direction: 'asc' },
+    ],
+  });
   lines.push(`by solvedAt asc: ${ordered.map((p) => p.title).join(',')}`);
 
   const page = await repo.findMany({

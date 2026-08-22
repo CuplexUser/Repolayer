@@ -328,6 +328,11 @@ What is not, and cannot be:
 - **Everything outside the query shape.** Full-text search, window functions, arrays, and
   extensions are all deliberately outside this interface. Use the driver directly for
   those, in one clearly marked place.
+- **Ties in an `orderBy` are not normalized.** Rows that tie on every sort key come back in
+  whatever order the engine read them, which is not the same order on every engine or even
+  on every run. `findPage` appends the primary key so that paging cannot skip or repeat a
+  row, but `findMany`, `findOne`, and `stream` pass the sort through as written. If the
+  order of tied rows matters, name a unique last sort key.
 - **Comparing a whole `json` value is textual, except on Postgres.** A json field is stored
   as the exact output of `JSON.stringify`, and `eq` and `ne` compare that text, so a filter
   has to be written the same shape it was stored in. Postgres compares `JSONB` structurally
