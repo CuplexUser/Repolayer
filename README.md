@@ -192,7 +192,10 @@ Three details the implementation insists on:
 
 - **The sort is made total.** The primary key is appended as a final tiebreaker unless you
   already sorted by it. Without that, rows that tie on every sort key have no defined order,
-  and a page boundary landing inside a tie skips one row and repeats another.
+  and a page boundary landing inside a tie skips one row and repeats another. Note what that
+  means when ids are uuids: tied rows come back in an arbitrary order, and two databases
+  holding the same rows will disagree about it. Name a unique second sort key yourself if a
+  tie needs a defined order.
 - **A token is only valid for the sort that produced it.** It carries a fingerprint of the
   `orderBy`, and using it under a different one throws rather than paging wrongly.
 - **Tokens carry a version.** One minted by an older deployment fails loudly instead of

@@ -107,11 +107,22 @@ async function exerciseRepo(repo: Repo<Puzzle>): Promise<string> {
 
   // Keyset paging walked to exhaustion has to reconstruct the whole ordered set, including
   // where the nulls land, on every engine.
+  //
+  // `title` is in the sort on purpose. Two puzzles here have a null solvedAt, and findPage
+  // makes a sort total by appending the primary key, which is a per-row random uuid. Those
+  // two rows would then come back in an order that differs from engine to engine, since
+  // each engine minted its own ids. Naming a unique second key is what an application wants
+  // here too: it is the only way a tie has a defined order.
   const walked: string[] = [];
   let after: string | null = null;
   for (;;) {
     const page = await repo.findPage(
-      { orderBy: [{ field: 'solvedAt', direction: 'desc' }] },
+      {
+        orderBy: [
+          { field: 'solvedAt', direction: 'desc' },
+          { field: 'title', direction: 'asc' },
+        ],
+      },
       { limit: 2, after },
     );
     walked.push(...page.items.map((p) => p.title));
