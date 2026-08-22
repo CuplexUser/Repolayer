@@ -325,6 +325,10 @@ What is not, and cannot be:
 - **Everything outside the query shape.** Full-text search, window functions, arrays, and
   extensions are all deliberately outside this interface. Use the driver directly for
   those, in one clearly marked place.
+- **Comparing a whole `json` value is textual, except on Postgres.** A json field is stored
+  as the exact output of `JSON.stringify`, and `eq` and `ne` compare that text, so a filter
+  has to be written the same shape it was stored in. Postgres compares `JSONB` structurally
+  and so also matches the same document written with its keys in another order.
 
 ### MySQL and MariaDB specifics
 
@@ -345,6 +349,12 @@ things that genuinely differ between them, so `driver: 'mysql'` is correct for e
   case pass, and they are applied whether the pool is repolayer's or yours.
 - **Dates are stored as UTC `DATETIME(6)`** and parsed back as UTC explicitly, so a
   timestamp does not shift when the server's timezone does.
+- **`json` columns are `LONGTEXT`, not the native `JSON` type.** A native JSON column holds
+  a normalized document, and MySQL does not match one against the text repolayer binds, so
+  `eq` and `ne` on a json field would answer differently there than on MariaDB, SQLite, and
+  `MemoryRepo`. MariaDB's `JSON` is a `LONGTEXT` alias already. If your tables come from a
+  migration tool and use the native type, filtering a whole json value will not match; read
+  the field and compare it in application code instead.
 
 ## Testing without a database
 

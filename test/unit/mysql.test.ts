@@ -176,7 +176,10 @@ describe('mysql ddl', () => {
     expect(sql).toContain('weight DOUBLE NOT NULL');
     expect(sql).toContain('active TINYINT(1) NOT NULL');
     expect(sql).toContain('released_at DATETIME(6)');
-    expect(sql).toContain('meta JSON');
+    // Deliberately not the native JSON type: that column holds a normalized document, and
+    // comparing it against the text `toDb` produced does not match on MySQL. LONGTEXT is
+    // what MariaDB's JSON alias already is, so both flavors compare the same bytes.
+    expect(sql).toContain('meta LONGTEXT');
   });
 
   it('creates string columns case sensitive rather than taking the server default', () => {

@@ -12,7 +12,7 @@ import type { FieldType, Schema } from './schema.js';
  *   integer   INTEGER                           BIGINT             BIGINT
  *   boolean   INTEGER 0/1                       BOOLEAN            TINYINT(1) 0/1
  *   date      TEXT, ISO-8601 UTC, fixed width   TIMESTAMPTZ        DATETIME(6), UTC
- *   json      TEXT via JSON.stringify           JSONB              JSON
+ *   json      TEXT via JSON.stringify           JSONB              LONGTEXT
  *
  * Application code never sees the difference: `toDb`/`fromDb` round trip real `Date`
  * objects, real booleans, and real numbers on both engines.

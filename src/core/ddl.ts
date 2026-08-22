@@ -62,8 +62,13 @@ function mysqlType(type: FieldType, indexed: boolean): string {
       // Microsecond precision, so a JS millisecond survives the round trip.
       return 'DATETIME(6)';
     case 'json':
-      // Native JSON on MySQL; on MariaDB an alias for LONGTEXT with a validity check.
-      return 'JSON';
+      // LONGTEXT rather than MySQL's native JSON, so both flavors store the exact text
+      // `toDb` produced. A native JSON column holds a normalized document, and comparing
+      // one against a bound string does not match on MySQL even when the document is the
+      // same, which would make `eq` and `ne` on a json field answer differently there than
+      // on MariaDB, SQLite, and MemoryRepo. MariaDB's JSON is a LONGTEXT alias already, so
+      // this is what that flavor was doing all along.
+      return 'LONGTEXT';
   }
 }
 
