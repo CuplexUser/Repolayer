@@ -93,14 +93,15 @@ jobs:
 
       - run: npm ci
 
+      - name: Build
+        # Must precede both the lint and the typecheck: examples/ import the built package
+        # from dist/ on purpose, so the examples also verify the generated .d.ts files are
+        # usable. On a clean runner there is no dist/ until this step runs, and without it
+        # every example resolves to `any` and the type-aware lint rules fail the build.
+        run: npm run build
+
       - name: Lint
         run: npm run lint
-
-      - name: Build
-        # Must precede the typecheck: examples/ import the built package from dist/ on
-        # purpose, so the examples also verify the generated .d.ts files are usable. On a
-        # clean runner there is no dist/ until this step runs.
-        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck

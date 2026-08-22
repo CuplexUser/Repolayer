@@ -67,8 +67,14 @@ try {
     cursor = page.next;
   } while (cursor !== null);
 
-  // The walk must reconstruct exactly what one unpaged query returns, nulls included.
-  const unpaged = (await repo.findMany(newestFirst)).map((p) => p.title);
+  // The walk must reconstruct exactly what one unpaged query returns, nulls included. The
+  // comparison reads that query under the *total* order, with the primary key appended,
+  // because appending it is what findPage does: two rows here share a null publishedAt, and
+  // a sort that leaves those two in an undefined order is nothing to compare against.
+  const totalOrder = {
+    orderBy: [...newestFirst.orderBy, { field: 'id' as const, direction: 'asc' as const }],
+  };
+  const unpaged = (await repo.findMany(totalOrder)).map((p) => p.title);
   assert.deepEqual(walked, unpaged, 'the paged walk did not match the unpaged query');
   console.log(`walked ${walked.length} rows, identical to one unpaged query`);
 
