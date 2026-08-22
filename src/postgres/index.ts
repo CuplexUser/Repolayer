@@ -5,7 +5,7 @@ import {
   type InternalTxContext,
 } from '../core/base.js';
 import type { Dialect } from '../core/dialect.js';
-import { ConnectionError, RepoError, UniqueConstraintError } from '../core/errors.js';
+import { ConnectionError, QueryError, RepoError, UniqueConstraintError } from '../core/errors.js';
 import type { IdStrategy, TimestampOptions } from '../core/repo.js';
 
 /**
@@ -74,7 +74,7 @@ export class PostgresConnection {
     // installed at all.
     let pg: { Pool: new (config: Record<string, unknown>) => PgPoolLike };
     try {
-      pg = (await import('pg')).default as typeof pg;
+      pg = (await import('pg')).default;
     } catch (error) {
       throw new ConnectionError(
         'The postgres driver requires the "pg" package. Install it with: npm install pg',
@@ -88,15 +88,13 @@ export class PostgresConnection {
     return PostgresConnection.forPool(pool, true);
   }
 
-  get executor(): Executor {
-    const pool = this.pool;
-    return {
-      async query(sql, params) {
-        const result = await pool.query(sql, params);
-        return result.rows;
-      },
-    };
-  }
+  /** Built once per connection: `defaultExecutor()` is called on every query. */
+  readonly executor: Executor = {
+    query: async (sql, params) => {
+      const result = await this.pool.query(sql, params);
+      return result.rows;
+    },
+  };
 
   async end(): Promise<void> {
     if (this.ended || !this.owned) return;
@@ -107,6 +105,9 @@ export class PostgresConnection {
 
 /** Postgres reports every unique violation as SQLSTATE 23505. */
 const UNIQUE_VIOLATION = '23505';
+
+/** Cursor names are generated, never taken from input. */
+let cursorCounter = 0;
 
 export class PostgresRepo<T, ID = string> extends BaseRepo<T, ID> {
   override readonly dialect: Dialect = 'postgres';
@@ -179,6 +180,64 @@ export class PostgresRepo<T, ID = string> extends BaseRepo<T, ID> {
       },
       release: () => client.release?.(),
     };
+  }
+
+  /**
+   * A real server-side cursor: `DECLARE` inside a transaction, then repeated
+   * `FETCH FORWARD n`. Rows never all arrive at the client, which is the entire point.
+   *
+   * A cursor only exists inside a transaction, so one is opened here when the repo is not
+   * already bound to one. The `finally` is doing the load-bearing work: without it a
+   * consumer that breaks out of the loop would leak a pooled client, and a leaked client
+   * permanently shrinks the pool until the process deadlocks.
+   */
+  protected override async *openCursor(
+    sql: string,
+    params: unknown[],
+    batchSize: number,
+  ): AsyncIterable<Record<string, unknown>[]> {
+    cursorCounter += 1;
+    const name = `repolayer_cur_${cursorCounter}`;
+    // Interpolated into FETCH, so it must be an integer this code produced. BaseRepo
+    // validates it before calling; this is the second line of that defense.
+    const size = Math.trunc(batchSize);
+    if (!Number.isInteger(size) || size < 1) {
+      throw new QueryError(`batchSize must be a positive integer, received ${String(batchSize)}`);
+    }
+
+    const bound = this.tx !== null;
+    const { executor, release } = bound
+      ? { executor: this.exec, release: (): void => undefined }
+      : await this.acquireTxExecutor();
+
+    let opened = false;
+    try {
+      if (!bound) await executor.query('BEGIN', []);
+      await executor.query(`DECLARE ${name} NO SCROLL CURSOR FOR ${sql}`, params);
+      opened = true;
+
+      for (;;) {
+        const rows = await executor.query(`FETCH FORWARD ${size} FROM ${name}`, []);
+        if (rows.length === 0) break;
+        yield rows;
+        if (rows.length < size) break;
+      }
+
+      if (opened) await executor.query(`CLOSE ${name}`, []);
+      opened = false;
+      if (!bound) await executor.query('COMMIT', []);
+    } catch (error) {
+      if (!bound) await executor.query('ROLLBACK', []).catch(() => undefined);
+      throw error;
+    } finally {
+      // Reached when a consumer breaks out of the loop, which is exactly the case that
+      // would otherwise leave a cursor open and a client checked out forever.
+      if (opened) {
+        await executor.query(`CLOSE ${name}`, []).catch(() => undefined);
+        if (!bound) await executor.query('COMMIT', []).catch(() => undefined);
+      }
+      release();
+    }
   }
 
   protected override mapError(error: unknown): unknown {

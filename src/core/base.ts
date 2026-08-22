@@ -1,21 +1,52 @@
 import { createTableStatements } from './ddl.js';
 import type { Dialect } from './dialect.js';
 import { NotFoundError, QueryError, RepoError, SchemaError } from './errors.js';
+import { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from './keyset.js';
 import {
   compileCount,
   compileSelect,
   compileWhere,
+  normalizeWhere,
   ParamList,
   selectList,
+  type Filter,
   type QueryOptions,
 } from './query.js';
-import type { IdStrategy, Repo, TimestampOptions, TxContext } from './repo.js';
+import type {
+  IdStrategy,
+  Page,
+  PageOptions,
+  Repo,
+  StreamOptions,
+  TimestampOptions,
+  TxContext,
+} from './repo.js';
 import type { FieldType, Schema } from './schema.js';
 import { rowToEntity, toDb } from './serialize.js';
+
+/** What a write reports on an engine that has no `RETURNING`. */
+export interface ExecuteResult {
+  /** Rows the statement returned, empty for a plain INSERT or UPDATE. */
+  rows: Record<string, unknown>[];
+  /** Rows the statement matched. Matched, not changed: see the MySQL adapter's FOUND_ROWS. */
+  rowCount: number;
+  /** First key assigned by an auto-increment INSERT, when the engine reports one. */
+  insertId?: number | null;
+}
 
 /** The one primitive an adapter must provide: run parameterized SQL, get rows back. */
 export interface Executor {
   query(sql: string, params: unknown[]): Promise<Record<string, unknown>[]>;
+  /**
+   * Runs a statement and reports what it affected.
+   *
+   * Optional, because an engine with `RETURNING` never needs it: the rows come back from
+   * the write itself. An engine without it (MySQL, MariaDB) has to be told how many rows a
+   * write touched and which key an insert assigned, and this is how. Adding it as an
+   * optional member rather than a required one keeps existing third-party adapters
+   * compiling untouched.
+   */
+  execute?(sql: string, params: unknown[]): Promise<ExecuteResult>;
 }
 
 /**
@@ -35,6 +66,12 @@ export interface BaseRepoOptions {
   ids: IdStrategy;
   timestamps: TimestampOptions;
 }
+
+/** Rows pulled per cursor round trip when the caller does not say. */
+const DEFAULT_BATCH_SIZE = 100;
+
+/** Rows per page when the caller does not say. */
+const DEFAULT_PAGE_SIZE = 50;
 
 /** Savepoint names are generated, never taken from input. */
 function savepointName(depth: number): string {
@@ -88,6 +125,31 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
   /** Translates a driver-native error into a `RepoError`, or returns it unchanged. */
   protected abstract mapError(error: unknown): unknown;
 
+  /**
+   * Whether writes can name the rows they touched with `RETURNING`.
+   *
+   * SQLite and Postgres both can, which makes every write one round trip. MySQL and
+   * MariaDB cannot, so `create` and `update` become a write plus a keyed read on the same
+   * connection, inside a transaction. Declaring it here rather than branching per adapter
+   * keeps the statement building in one place, where the two paths cannot drift.
+   */
+  protected get supportsReturning(): boolean {
+    return true;
+  }
+
+  /**
+   * Opens a cursor over `sql` and yields rows in batches.
+   *
+   * Written as an async generator by every adapter, because the `finally` block of one is
+   * what guarantees the cursor is closed and the connection released when a consumer
+   * leaves the loop early. That is the whole reason streaming was not in v1.
+   */
+  protected abstract openCursor(
+    sql: string,
+    params: unknown[],
+    batchSize: number,
+  ): AsyncIterable<Record<string, unknown>[]>;
+
   abstract close(): Promise<void>;
 
   // ---------------------------------------------------------------- internals
@@ -129,6 +191,23 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
   private async run(sql: string, params: unknown[]): Promise<Record<string, unknown>[]> {
     try {
       return await this.exec.query(sql, params);
+    } catch (error) {
+      throw this.mapError(error);
+    }
+  }
+
+  /** Runs a statement for its effect rather than its rows. Needs `Executor.execute`. */
+  private async runExecute(sql: string, params: unknown[]): Promise<ExecuteResult> {
+    const executor = this.exec;
+    if (executor.execute === undefined) {
+      /* c8 ignore next 4 -- an adapter without RETURNING must provide execute() */
+      throw new RepoError(
+        'This adapter reports no RETURNING support, so its Executor must implement ' +
+          'execute(). See the MySQL adapter for the shape.',
+      );
+    }
+    try {
+      return await executor.execute(sql, params);
     } catch (error) {
       throw this.mapError(error);
     }
@@ -177,6 +256,72 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     return typeof raw === 'number' ? raw : Number(raw ?? 0);
   }
 
+  // ---------------------------------------------------------------- cursors
+
+  stream(query?: QueryOptions<T>, opts?: StreamOptions): AsyncIterable<T> {
+    // The generator is only started when the caller iterates, so nothing is opened for an
+    // iterable that is never consumed, and a compile error surfaces as a rejected `next()`
+    // rather than a synchronous throw out of a method that returns an iterable.
+    return { [Symbol.asyncIterator]: () => this.streamRows(query, opts) };
+  }
+
+  private async *streamRows(
+    query: QueryOptions<T> | undefined,
+    opts: StreamOptions | undefined,
+  ): AsyncGenerator<T> {
+    const batchSize = opts?.batchSize ?? DEFAULT_BATCH_SIZE;
+    const signal = opts?.signal;
+
+    if (!Number.isInteger(batchSize) || batchSize < 1) {
+      throw new QueryError(`batchSize must be a positive integer, received ${String(batchSize)}`);
+    }
+    if (signal?.aborted) throw signal.reason;
+
+    const { sql, params } = compileSelect(this.schema, this.table, query, this.dialect);
+    try {
+      for await (const batch of this.openCursor(sql, params, batchSize)) {
+        // Checked per batch rather than per row: a row is not a place where waiting
+        // happens, and the cost of the check would be paid for nothing.
+        if (signal?.aborted) throw signal.reason;
+        for (const row of batch) yield this.toEntity(row);
+      }
+    } catch (error) {
+      throw this.mapError(error);
+    }
+  }
+
+  async findPage(query?: QueryOptions<T>, opts?: PageOptions): Promise<Page<T>> {
+    const limit = opts?.limit ?? DEFAULT_PAGE_SIZE;
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new QueryError(`Page limit must be a positive integer, received ${String(limit)}`);
+    }
+    if (query?.offset !== undefined) {
+      throw new QueryError(
+        'findPage does not take an offset. Keyset paging replaces offset paging: pass the ' +
+          'previous page cursor as `after` instead.',
+      );
+    }
+
+    const keys = resolveSortKeys<T>(this.schema, query?.orderBy);
+    const where: Filter<T>[] = [...normalizeWhere(query?.where)];
+    if (opts?.after) {
+      where.push(keysetFilter(keys, decodeCursor(this.schema, keys, opts.after)));
+    }
+
+    // One row past the page is what tells us whether there is a next page, without a
+    // second count query that could disagree with this one.
+    const rows = await this.findMany({ ...query, where, orderBy: keys, limit: limit + 1 });
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const last = items[items.length - 1];
+
+    return {
+      items,
+      cursor: hasMore && last !== undefined ? encodeCursor(this.schema, keys, last) : null,
+      hasMore,
+    };
+  }
+
   // ---------------------------------------------------------------- writes
 
   /**
@@ -194,9 +339,7 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
       // the table cannot disagree later.
       delete record[pk];
     } else if (record[pk] === undefined || record[pk] === null) {
-      throw new QueryError(
-        `The "provided" id strategy requires an explicit "${pk}" on create.`,
-      );
+      throw new QueryError(`The "provided" id strategy requires an explicit "${pk}" on create.`);
     }
 
     const now = new Date();
@@ -239,13 +382,82 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     });
 
     const columns = fields.map((f) => this.schema.columns[f]).join(', ');
+    // "INSERT INTO t DEFAULT VALUES" is the SQLite and Postgres spelling; MySQL writes an
+    // empty column list instead. Same statement, two grammars.
+    const empty =
+      this.dialect === 'mysql'
+        ? `INSERT INTO ${this.table} () VALUES ()`
+        : `INSERT INTO ${this.table} DEFAULT VALUES`;
     const sql =
       fields.length === 0
-        ? `INSERT INTO ${this.table} DEFAULT VALUES RETURNING ${selectList(this.schema)}`
-        : `INSERT INTO ${this.table} (${columns}) VALUES ${tuples.join(', ')} ` +
-          `RETURNING ${selectList(this.schema)}`;
+        ? empty
+        : `INSERT INTO ${this.table} (${columns}) VALUES ${tuples.join(', ')}`;
 
     return { sql, params: params.values };
+  }
+
+  /** Reads rows back by primary key, in the order the keys were given. */
+  private async selectByIds(ids: unknown[]): Promise<T[]> {
+    if (ids.length === 0) return [];
+    const params = new ParamList(this.dialect);
+    const pkType = this.schema.types[this.schema.primaryKey] as FieldType;
+    const placeholders = ids
+      .map((id) => params.add(toDb(id, pkType, this.dialect, this.schema.primaryKey)))
+      .join(', ');
+    const sql =
+      `SELECT ${selectList(this.schema)} FROM ${this.table} ` +
+      `WHERE ${this.pkColumn()} IN (${placeholders})`;
+
+    const rows = await this.run(sql, params.values);
+    // IN does not preserve the order of its list, so the rows are put back into insertion
+    // order here. Returning a batch in a different order than it was written would be a
+    // quiet difference between engines that createMany's own conformance case would catch.
+    const byId = new Map(
+      rows.map((row) => [String(row[this.pkColumn()]), this.toEntity(row)] as const),
+    );
+    return ids
+      .map((id) => byId.get(String(id)))
+      .filter((entity): entity is T => entity !== undefined);
+  }
+
+  /**
+   * The write-then-read path for engines without `RETURNING`.
+   *
+   * Both statements must see the same state, so they run on one connection inside a
+   * transaction. When the caller already opened one, this joins it rather than nesting a
+   * pointless savepoint.
+   */
+  private async insertAndSelect(
+    records: Record<string, unknown>[],
+    sql: string,
+    params: unknown[],
+  ): Promise<T[]> {
+    const pk = this.schema.primaryKey;
+
+    const perform = async (repo: BaseRepo<T, ID>): Promise<T[]> => {
+      const result = await repo.runExecute(sql, params);
+
+      let ids: unknown[];
+      if (this.ids === 'autoincrement') {
+        // A single multi-row INSERT is assigned a contiguous block of keys, so the first
+        // one plus the row count names every row the statement created.
+        const first = result.insertId;
+        if (first === undefined || first === null) {
+          throw new RepoError(
+            `The ${this.dialect} driver did not report an insert id, so the rows just ` +
+              `written under the "autoincrement" strategy cannot be read back.`,
+          );
+        }
+        ids = records.map((_, index) => Number(first) + index);
+      } else {
+        ids = records.map((record) => record[pk]);
+      }
+
+      return repo.selectByIds(ids);
+    };
+
+    if (this.tx) return perform(this);
+    return this.withTransaction(async (scoped) => perform(scoped as BaseRepo<T, ID>));
   }
 
   async create(data: Partial<T>): Promise<T> {
@@ -257,23 +469,49 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     if (data.length === 0) return [];
     const records = data.map((item) => this.prepareInsert(item));
     const { sql, params } = this.insertStatement(records);
-    const rows = await this.run(sql, params);
+
+    if (!this.supportsReturning) return this.insertAndSelect(records, sql, params);
+
+    const rows = await this.run(`${sql} RETURNING ${selectList(this.schema)}`, params);
     return rows.map((row) => this.toEntity(row));
   }
 
-  async update(id: ID, data: Partial<T>): Promise<T> {
+  /**
+   * Shared by `update` and `updateMany`: strips the primary key, rejects unknown fields,
+   * and applies the `updatedAt` stamp. Keeping it in one place is what stops the two from
+   * disagreeing about which fields a write is allowed to touch.
+   */
+  private prepareUpdate(data: Partial<T>, context: string): Record<string, unknown> {
     const record: Record<string, unknown> = { ...data };
     delete record[this.schema.primaryKey];
 
     for (const key of Object.keys(record)) {
       if (this.schema.types[key] === undefined) {
         throw new QueryError(
-          `Unknown field "${key}" in update. Known fields: ${this.schema.fieldNames.join(', ')}`,
+          `Unknown field "${key}" in ${context}. Known fields: ` +
+            `${this.schema.fieldNames.join(', ')}`,
         );
       }
     }
     if (this.timestamps.updatedAt) record[this.timestamps.updatedAt] = new Date();
     if (this.timestamps.createdAt) delete record[this.timestamps.createdAt];
+    return record;
+  }
+
+  /** Renders `SET a = ?, b = ?`, binding each value the way its column stores it. */
+  private assignments(record: Record<string, unknown>, params: ParamList): string {
+    return Object.keys(record)
+      .map(
+        (field) =>
+          `${this.schema.columns[field]} = ${params.add(
+            toDb(record[field], this.schema.types[field] as FieldType, this.dialect, field),
+          )}`,
+      )
+      .join(', ');
+  }
+
+  async update(id: ID, data: Partial<T>): Promise<T> {
+    const record = this.prepareUpdate(data, 'update');
 
     const fields = Object.keys(record);
     if (fields.length === 0) {
@@ -284,28 +522,72 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     }
 
     const params = new ParamList(this.dialect);
-    const assignments = fields.map(
-      (field) =>
-        `${this.schema.columns[field]} = ${params.add(
-          toDb(record[field], this.schema.types[field] as FieldType, this.dialect, field),
-        )}`,
-    );
     const sql =
-      `UPDATE ${this.table} SET ${assignments.join(', ')} ` +
-      `WHERE ${this.pkColumn()} = ${this.bindId(id, params)} ` +
-      `RETURNING ${selectList(this.schema)}`;
+      `UPDATE ${this.table} SET ${this.assignments(record, params)} ` +
+      `WHERE ${this.pkColumn()} = ${this.bindId(id, params)}`;
 
-    const rows = await this.run(sql, params.values);
+    if (!this.supportsReturning) return this.updateAndSelect(id, sql, params.values);
+
+    const rows = await this.run(`${sql} RETURNING ${selectList(this.schema)}`, params.values);
     if (rows.length === 0) throw new NotFoundError(this.table, id);
     return this.toEntity(rows[0] as Record<string, unknown>);
   }
 
-  async delete(id: ID): Promise<void> {
+  /** `update` for engines without `RETURNING`: write, then read the row back. */
+  private async updateAndSelect(id: ID, sql: string, params: unknown[]): Promise<T> {
+    const perform = async (repo: BaseRepo<T, ID>): Promise<T> => {
+      const result = await repo.runExecute(sql, params);
+      // Matched rows, not changed rows. An update that sets a column to the value it
+      // already holds still found its row, and must not read as a missing one.
+      if (result.rowCount === 0) throw new NotFoundError(this.table, id);
+      const [row] = await repo.selectByIds([id]);
+      if (row === undefined) throw new NotFoundError(this.table, id);
+      return row;
+    };
+
+    if (this.tx) return perform(this);
+    return this.withTransaction(async (scoped) => perform(scoped as BaseRepo<T, ID>));
+  }
+
+  /**
+   * Applies the same change to every row matching a filter, and reports how many matched.
+   *
+   * The counterpart of `deleteMany`. It reports rows *matched*, not rows whose values
+   * actually changed, so setting a field to the value it already holds still counts: the
+   * alternative would make the number depend on the data rather than on the filter.
+   */
+  async updateMany(query: QueryOptions<T> | undefined, data: Partial<T>): Promise<number> {
+    const record = this.prepareUpdate(data, 'updateMany');
+    if (Object.keys(record).length === 0) {
+      // Nothing to set and no timestamp to stamp, so the only honest answer is how many
+      // rows the filter matched.
+      return this.count(query);
+    }
+
     const params = new ParamList(this.dialect);
     const sql =
-      `DELETE FROM ${this.table} WHERE ${this.pkColumn()} = ${this.bindId(id, params)} ` +
-      `RETURNING ${this.pkColumn()}`;
-    const rows = await this.run(sql, params.values);
+      `UPDATE ${this.table} SET ${this.assignments(record, params)}` +
+      compileWhere(query?.where, this.schema, this.dialect, params);
+
+    if (!this.supportsReturning) {
+      return (await this.runExecute(sql, params.values)).rowCount;
+    }
+
+    const rows = await this.run(`${sql} RETURNING ${this.pkColumn()}`, params.values);
+    return rows.length;
+  }
+
+  async delete(id: ID): Promise<void> {
+    const params = new ParamList(this.dialect);
+    const sql = `DELETE FROM ${this.table} WHERE ${this.pkColumn()} = ${this.bindId(id, params)}`;
+
+    if (!this.supportsReturning) {
+      const result = await this.runExecute(sql, params.values);
+      if (result.rowCount === 0) throw new NotFoundError(this.table, id);
+      return;
+    }
+
+    const rows = await this.run(`${sql} RETURNING ${this.pkColumn()}`, params.values);
     if (rows.length === 0) throw new NotFoundError(this.table, id);
   }
 
@@ -313,10 +595,13 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
   async deleteMany(query?: QueryOptions<T>): Promise<number> {
     const params = new ParamList(this.dialect);
     const sql =
-      `DELETE FROM ${this.table}` +
-      compileWhere(query?.where, this.schema, this.dialect, params) +
-      ` RETURNING ${this.pkColumn()}`;
-    const rows = await this.run(sql, params.values);
+      `DELETE FROM ${this.table}` + compileWhere(query?.where, this.schema, this.dialect, params);
+
+    if (!this.supportsReturning) {
+      return (await this.runExecute(sql, params.values)).rowCount;
+    }
+
+    const rows = await this.run(`${sql} RETURNING ${this.pkColumn()}`, params.values);
     return rows.length;
   }
 
@@ -324,9 +609,7 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
 
   with(ctx: TxContext): this {
     if (ctx.dialect !== this.dialect) {
-      throw new RepoError(
-        `Cannot bind a ${this.dialect} repo to a ${ctx.dialect} transaction.`,
-      );
+      throw new RepoError(`Cannot bind a ${this.dialect} repo to a ${ctx.dialect} transaction.`);
     }
     if (ctx.connectionId !== this.connectionId()) {
       throw new RepoError(

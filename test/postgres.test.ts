@@ -26,13 +26,17 @@ if (!url) {
         schema: options.schema,
         connection,
         ids: options.ids ?? 'uuid',
-        timestamps: options.timestamps
-          ? { createdAt: 'createdAt', updatedAt: 'updatedAt' }
-          : {},
+        timestamps: options.timestamps ? { createdAt: 'createdAt', updatedAt: 'updatedAt' } : {},
       });
       await repo.ensureTable();
       created.push(options.table);
       return repo;
+    },
+    // pg's Pool exposes its counts, which is what lets the cursor cases prove an early
+    // break does not leak a checked-out client.
+    busyConnections() {
+      const pool = connection.pool as unknown as { totalCount: number; idleCount: number };
+      return pool.totalCount - pool.idleCount;
     },
     async cleanup() {
       for (const table of created) {

@@ -1,15 +1,15 @@
 /**
  * The package's central claim, executed.
  *
- * One schema, one piece of repository logic, run against SQLite and then against
- * Postgres with a single config value changed. The two runs must produce byte-identical
- * output. If they ever do not, the abstraction has sprung a leak and this script says so
- * with a non-zero exit code.
+ * One schema, one piece of repository logic, run against SQLite, then Postgres, then
+ * MySQL, then MariaDB, with a single config value changed each time. Every run must
+ * produce byte-identical output. If any of them differs, the abstraction has sprung a leak
+ * and this script says so with a non-zero exit code.
  *
- *   node --experimental-strip-types examples/swap/index.ts
- *   TEST_DATABASE_URL=postgres://... node --experimental-strip-types examples/swap/index.ts
+ *   npm run example:swap
+ *   TEST_DATABASE_URL=postgres://... TEST_MYSQL_URL=mysql://... npm run example:swap
  *
- * Without TEST_DATABASE_URL it runs the SQLite half only and says so.
+ * Engines whose URL is absent are skipped, and the script says which.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -49,11 +49,18 @@ async function exerciseRepo(repo: Repo<Puzzle>): Promise<string> {
   ]);
 
   lines.push(`count: ${await repo.count()}`);
-  lines.push(`hard: ${await repo.count({ where: [{ field: 'difficulty', op: 'gte', value: 5 }] })}`);
+  lines.push(
+    `hard: ${await repo.count({ where: [{ field: 'difficulty', op: 'gte', value: 5 }] })}`,
+  );
 
   // Case sensitivity is normalized, so these two disagree the same way on both engines.
   const likeRows = await repo.findMany({ where: [{ field: 'title', op: 'like', value: '%o%' }] });
-  lines.push(`like %o%: ${likeRows.map((p) => p.title).sort().join(',')}`);
+  lines.push(
+    `like %o%: ${likeRows
+      .map((p) => p.title)
+      .sort()
+      .join(',')}`,
+  );
   const ilikeRows = await repo.findMany({ where: [{ field: 'title', op: 'ilike', value: 'N%' }] });
   lines.push(`ilike N%: ${ilikeRows.map((p) => p.title).join(',')}`);
 
@@ -73,7 +80,50 @@ async function exerciseRepo(repo: Repo<Puzzle>): Promise<string> {
   lines.push(`updated: ${updated.title} solved=${updated.solved} difficulty=${updated.difficulty}`);
   lines.push(`tags round trip: ${JSON.stringify(updated.tags)}`);
 
-  // A transaction that rolls back must leave nothing behind, on either engine.
+  // A filter tree has to group the same way everywhere, parentheses and all.
+  const grouped = await repo.findMany({
+    where: [
+      { field: 'solved', op: 'eq', value: true },
+      {
+        or: [
+          { field: 'difficulty', op: 'gte', value: 5 },
+          { field: 'title', op: 'eq', value: 'Sudoku' },
+        ],
+      },
+    ],
+    orderBy: [{ field: 'title', direction: 'asc' }],
+  });
+  lines.push(`solved and (hard or sudoku): ${grouped.map((p) => p.title).join(',')}`);
+
+  // A cursor walks the same rows in the same order as findMany, in batches.
+  const streamed: string[] = [];
+  for await (const puzzle of repo.stream(
+    { orderBy: [{ field: 'title', direction: 'asc' }] },
+    { batchSize: 2 },
+  )) {
+    streamed.push(puzzle.title);
+  }
+  lines.push(`streamed: ${streamed.join(',')}`);
+
+  // Keyset paging walked to exhaustion has to reconstruct the whole ordered set, including
+  // where the nulls land, on every engine.
+  const walked: string[] = [];
+  let after: string | null = null;
+  for (;;) {
+    const page = await repo.findPage(
+      { orderBy: [{ field: 'solvedAt', direction: 'desc' }] },
+      { limit: 2, after },
+    );
+    walked.push(...page.items.map((p) => p.title));
+    if (!page.hasMore) break;
+    after = page.cursor;
+  }
+  lines.push(`paged by solvedAt desc: ${walked.join(',')}`);
+
+  const bumped = await repo.updateMany({ where: { solved: false } }, { difficulty: 2 });
+  lines.push(`updateMany: ${bumped}`);
+
+  // A transaction that rolls back must leave nothing behind, on any engine.
   await repo
     .withTransaction(async (tx) => {
       await tx.create({ title: 'Ghost', difficulty: 1, solved: false, tags: null, solvedAt: null });
@@ -106,9 +156,9 @@ async function runSqlite(): Promise<string> {
   }
 }
 
-async function runPostgres(connectionString: string): Promise<string> {
+async function runServer(driver: 'postgres' | 'mysql', connectionString: string): Promise<string> {
   const repo = await createRepo<Puzzle>({
-    driver: 'postgres', // <- the only line that changes
+    driver, // <- the only line that changes
     table: 'puzzles_swap_example',
     schema: puzzleSchema,
     connection: { connectionString },
@@ -128,19 +178,39 @@ const sqliteOutput = await runSqlite();
 console.log('--- sqlite ---');
 console.log(sqliteOutput);
 
-const url = process.env['TEST_DATABASE_URL'];
-if (!url) {
-  console.log('\n--- postgres ---');
-  console.log('skipped: set TEST_DATABASE_URL to run the Postgres half and compare.');
-} else {
-  const postgresOutput = await runPostgres(url);
-  console.log('\n--- postgres ---');
-  console.log(postgresOutput);
+/**
+ * Every engine that has a URL. MariaDB rides the same driver as MySQL, which is the point
+ * of them sharing one adapter.
+ */
+const servers = [
+  { name: 'postgres', driver: 'postgres', env: 'TEST_DATABASE_URL' },
+  { name: 'mysql', driver: 'mysql', env: 'TEST_MYSQL_URL' },
+  { name: 'mariadb', driver: 'mysql', env: 'TEST_MARIADB_URL' },
+] as const;
+
+const compared: string[] = ['sqlite'];
+
+for (const server of servers) {
+  const url = process.env[server.env];
+  console.log(`\n--- ${server.name} ---`);
+  if (!url) {
+    console.log(`skipped: set ${server.env} to run this engine and compare.`);
+    continue;
+  }
+
+  const output = await runServer(server.driver, url);
+  console.log(output);
 
   assert.equal(
-    postgresOutput,
+    output,
     sqliteOutput,
-    'The two drivers produced different output. That is a leak in the abstraction.',
+    `${server.name} produced different output than sqlite. That is a leak in the abstraction.`,
   );
-  console.log('\nidentical output on both drivers.');
+  compared.push(server.name);
 }
+
+console.log(
+  compared.length > 1
+    ? `\nidentical output on ${compared.join(', ')}.`
+    : '\nonly sqlite ran. Set the other engine URLs to compare against it.',
+);

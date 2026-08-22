@@ -12,7 +12,15 @@ export interface PostgresDriverConfig {
   connection: { connectionString: string; max?: number } | object;
 }
 
-export type CreateRepoConfig<T> = (SqliteDriverConfig | PostgresDriverConfig) & {
+export interface MysqlDriverConfig {
+  /** Covers MariaDB too: one adapter, with the flavor detected at connect. */
+  driver: 'mysql';
+  connection: { connectionString: string; max?: number } | object;
+}
+
+export type CreateRepoConfig<T> = (
+  SqliteDriverConfig | PostgresDriverConfig | MysqlDriverConfig
+) & {
   table: string;
   schema: Schema;
   /** How the primary key is produced. Defaults to 'uuid'. */
@@ -69,10 +77,19 @@ export async function createRepo<T, ID = string>(
       ids,
       timestamps,
     });
+  } else if (config.driver === 'mysql') {
+    const { createMysqlRepo } = await import('../mysql/index.js');
+    repo = await createMysqlRepo<T, ID>({
+      table: config.table,
+      schema: config.schema,
+      connection: config.connection as { connectionString: string },
+      ids,
+      timestamps,
+    });
   } else {
     throw new ConnectionError(
       `Unknown driver ${JSON.stringify((config as { driver: string }).driver)}. ` +
-        `Supported drivers: "sqlite", "postgres".`,
+        `Supported drivers: "sqlite", "postgres", "mysql" (which covers MariaDB).`,
     );
   }
 

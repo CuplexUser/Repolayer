@@ -6,9 +6,9 @@
 Define your data access once against a plain interface, and swap the storage engine
 underneath without touching application code.
 
-Start on SQLite because it needs no setup and lives in a file. Move to Postgres when you
-need concurrent writers, hosted scaling, or more than one instance. Change one config
-value instead of rewriting every query.
+Start on SQLite because it needs no setup and lives in a file. Move to Postgres, MySQL, or
+MariaDB when you need concurrent writers, hosted scaling, or more than one instance. Change
+one config value instead of rewriting every query.
 
 ```ts
 const repo = await createRepo<Puzzle>({
@@ -23,7 +23,7 @@ const repo = await createRepo<Puzzle>({
 
 Not an ORM. There is no query builder DSL to learn, no migration engine, no relationship
 mapping, and no lazy-loading magic. It is a deliberately boring contract: a `Repo<T>`
-interface with predictable methods, a small serializable query shape, and two adapters
+interface with predictable methods, a small serializable query shape, and four adapters
 that satisfy it identically.
 
 The filter language is kept small on purpose. Most ORMs leak the moment you need something
@@ -34,12 +34,23 @@ the same way, and it is why the abstraction can hold.
 
 ```bash
 npm install repolayer
-npm install pg     # only if you use the Postgres driver
+npm install pg       # only for the Postgres driver
+npm install mysql2   # only for the MySQL or MariaDB driver
 ```
 
+Both are optional peer dependencies, imported lazily, so a project on one engine never
+loads the other one's driver and does not need it installed.
+
+| driver | engine | needs |
+|---|---|---|
+| `sqlite` | SQLite, through `node:sqlite` | nothing |
+| `postgres` | PostgreSQL | `pg` |
+| `mysql` | MySQL **and** MariaDB | `mysql2` |
+| (none) | `MemoryRepo`, for tests | nothing |
+
 Requires Node 22.5 or newer. `node:sqlite` is stable on Node 24+, unflagged on 23.4+, and
-needs `--experimental-sqlite` on 22.5 through 23.3. The core and Postgres paths have no
-such constraint.
+needs `--experimental-sqlite` on 22.5 through 23.3. The other engines have no such
+constraint.
 
 ## Define a schema
 
@@ -89,12 +100,105 @@ await repo.findMany({
 });
 
 await repo.update(puzzle.id, { solved: true });   // throws NotFoundError if it is gone
+await repo.updateMany({ where: { solved: false } }, { difficulty: 1 });   // -> how many
 await repo.delete(puzzle.id);
 await repo.deleteMany({ where: { solved: true } });
+
+for await (const puzzle of repo.stream({ where: { solved: false } })) { /* batched */ }
+await repo.findPage({ orderBy: [{ field: 'createdAt', direction: 'desc' }] }, { limit: 20 });
 ```
 
 `where` also accepts an object, read as an implicit AND of equality checks:
 `{ where: { solved: false, difficulty: 5 } }`.
+
+### Filter trees
+
+An array of filters is an implicit AND. For anything else, group them. Groups nest, and the
+whole thing stays plain JSON, so a filter can cross an HTTP boundary or sit in a config file
+without a serializer.
+
+```ts
+await repo.findMany({
+  where: [
+    { field: 'solved', op: 'eq', value: false },        // AND
+    {
+      or: [
+        { field: 'difficulty', op: 'gte', value: 8 },
+        { and: [
+          { field: 'tags', op: 'isNull', value: false },
+          { field: 'title', op: 'ilike', value: 'sud%' },
+        ] },
+      ],
+    },
+  ],
+});
+```
+
+Groups are always parenthesized in the generated SQL, so precedence cannot slip. An empty
+`or` matches nothing and an empty `and` matches everything, which is the same convention an
+empty `in` and `nin` already follow. Nesting is capped at 16 levels: a serializable filter
+can arrive from a request, and an unbounded tree would compile to unbounded SQL.
+
+### Streaming
+
+`repo.stream()` pulls rows in batches instead of materializing the result, so a table larger
+than memory can be exported, migrated, or re-indexed.
+
+```ts
+for await (const row of repo.stream({ where: { status: 'queued' } }, { batchSize: 500 })) {
+  await handle(row);
+}
+```
+
+It is a real server-side cursor on Postgres (`DECLARE` plus repeated `FETCH FORWARD`) and a
+stepped statement on SQLite (`StatementSync.iterate()`). Both hold a resource for as long as
+the loop runs, so the contract around leaving early is the important part:
+
+- Leaving the loop with `break`, `return`, or a throw closes the cursor and ends the
+  transaction it opened. Nothing leaks, and the suite asserts the pool returns to its
+  baseline size after an early break.
+- An iterable you never iterate never opens anything.
+- Pass an `AbortSignal` to cancel from outside the loop. The signal's reason is what gets
+  thrown, so a caller's own error object comes back out unchanged.
+- To write inside the loop as part of the same transaction, stream from a transaction-bound
+  repo: `repo.withTransaction(async (tx) => { for await (const row of tx.stream()) ... })`.
+
+Two limits worth knowing. On SQLite a long-lived cursor holds a read lock, and on a
+single-writer engine that blocks writers for its whole duration; mutating the table you are
+streaming is unspecified, so write to a different one. On MySQL there is no server-side
+cursor for a plain SELECT, so `stream` fetches the result and hands it out in batches: the
+API is identical, but peak memory is not reduced there.
+
+### Paging
+
+`repo.findPage()` is keyset paging with an opaque cursor token. Unlike a stream it holds
+nothing between calls, so the next page can be fetched by a different process minutes later.
+
+```ts
+const page = await repo.findPage(
+  { orderBy: [{ field: 'createdAt', direction: 'desc' }] },
+  { limit: 50, after: previousPage.cursor },
+);
+// { items: T[], cursor: string | null, hasMore: boolean }
+```
+
+The token encodes the sort-key values of the last row, and the next page compiles to a
+keyset predicate rather than an `OFFSET`. That matters for two reasons: page 10,000 costs the
+same as page 1, and rows inserted or deleted during the walk cannot shift a page underneath
+you. `npm run example:paging-api` runs both approaches side by side against a table that is
+being written to, and offset paging visibly repeats rows that keyset paging does not.
+
+Three details the implementation insists on:
+
+- **The sort is made total.** The primary key is appended as a final tiebreaker unless you
+  already sorted by it. Without that, rows that tie on every sort key have no defined order,
+  and a page boundary landing inside a tie skips one row and repeats another.
+- **A token is only valid for the sort that produced it.** It carries a fingerprint of the
+  `orderBy`, and using it under a different one throws rather than paging wrongly.
+- **Tokens carry a version.** One minted by an older deployment fails loudly instead of
+  being misread.
+
+`findPage` rejects an `offset`, because mixing the two is always a mistake.
 
 ### Operators
 
@@ -128,6 +232,19 @@ try {
 
 `RepoError` is the base. `NotFoundError`, `UniqueConstraintError`, `QueryError`,
 `ConnectionError`, and `SchemaError` extend it.
+
+### Bulk writes
+
+`deleteMany` and `updateMany` both take a filter and report how many rows matched.
+
+```ts
+await repo.updateMany({ where: { status: 'queued' } }, { status: 'running' });   // -> number
+await repo.deleteMany({ where: [{ field: 'createdAt', op: 'lt', value: cutoff }] });
+```
+
+`updateMany` counts rows **matched**, not rows whose values actually changed, so setting a
+field to the value it already holds still counts. The alternative would make the number
+depend on the data rather than on the filter, and would make MySQL disagree with the others.
 
 ### Ids and timestamps
 
@@ -181,16 +298,21 @@ migrations out is what keeps this package small.
 The abstraction normalizes what it honestly can, and documents the rest rather than
 pretending. What is normalized:
 
-- **`like` case sensitivity.** SQLite's LIKE is case insensitive for ASCII by default and
-  Postgres's is not. The SQLite adapter sets `PRAGMA case_sensitive_like = ON`, so `like`
-  is case sensitive and `ilike` is not, on both.
-- **NULL ordering.** Postgres sorts NULLs last on ASC, SQLite sorts them first. Every
-  generated `ORDER BY` states the position explicitly, so a paged result set survives a
-  driver swap.
-- **Storage types.** Booleans, dates, and JSON are stored differently and round trip
-  through real `boolean`, `Date`, and parsed JSON values on both.
-- **Constraint errors.** `SQLITE_CONSTRAINT_UNIQUE` and SQLSTATE `23505` both become
-  `UniqueConstraintError`.
+- **`like` case sensitivity.** SQLite's LIKE is case insensitive for ASCII by default,
+  Postgres's is not, and MySQL's depends on the column's collation. The SQLite adapter sets
+  `PRAGMA case_sensitive_like = ON` and the MySQL compiler forces a binary collation on the
+  comparison, so `like` is case sensitive and `ilike` is not, everywhere.
+- **NULL ordering.** Postgres sorts NULLs last on ASC; SQLite and MySQL sort them first.
+  Every generated `ORDER BY` states the position explicitly, and since MySQL has no
+  `NULLS LAST` syntax at all it compiles to an `ORDER BY (col IS NULL), col` prefix that
+  produces the same order.
+- **Storage types.** Booleans, dates, and JSON are stored differently on each engine and
+  round trip through real `boolean`, `Date`, and parsed JSON values on all of them.
+- **Constraint errors.** `SQLITE_CONSTRAINT_UNIQUE`, SQLSTATE `23505`, and MySQL error
+  `1062` all become `UniqueConstraintError`, naming the same schema field.
+- **`RETURNING`.** SQLite and Postgres have it, MySQL does not. On MySQL a `create` or
+  `update` is a write plus a keyed read on one connection inside a transaction, so the
+  return value is the same; it just costs a second statement.
 
 What is not, and cannot be:
 
@@ -204,11 +326,54 @@ What is not, and cannot be:
   extensions are all deliberately outside this interface. Use the driver directly for
   those, in one clearly marked place.
 
+### MySQL and MariaDB specifics
+
+One adapter serves both. It asks the server what it is at connect time and adjusts the two
+things that genuinely differ between them, so `driver: 'mysql'` is correct for either.
+
+- **Text columns must be utf8mb4.** `ensureTable` creates them as
+  `utf8mb4 COLLATE utf8mb4_bin`, because the server default is a case-insensitive collation
+  under which `=`, `in`, `unique`, and `ORDER BY` on text would all behave differently than
+  on SQLite and Postgres. If your tables come from a migration tool, create string columns
+  the same way: forcing a collation onto a latin1 column is an error rather than a
+  comparison.
+- **Reserved words.** Identifiers are never quoted, on any engine, so a column named `order`
+  or `rank` will not work. Quoting them would change how Postgres folds case on existing
+  tables, which is a worse trade than the limitation.
+- **Driver options are set for you.** `FOUND_ROWS`, `jsonStrings`, `dateStrings`, and the
+  big-number options are not preferences: each one exists to make a specific conformance
+  case pass, and they are applied whether the pool is repolayer's or yours.
+- **Dates are stored as UTC `DATETIME(6)`** and parsed back as UTC explicitly, so a
+  timestamp does not shift when the server's timezone does.
+
+## Testing without a database
+
+`MemoryRepo` is a full `Repo<T>` that keeps everything in memory. It needs no driver, no
+file, and no cleanup, which makes it a good target for unit tests of code written against
+`Repo<T>`.
+
+```ts
+import { MemoryRepo } from 'repolayer/memory';
+
+const repo = new MemoryRepo<Order>({ table: 'orders', schema: orderSchema });
+const service = new OrderService(repo);
+```
+
+It is trustworthy for one reason only: it passes the same conformance suite as the real
+adapters. Filters, null ordering, `like` case sensitivity, unique constraints, transactions
+and savepoints, streaming, and keyset paging all behave the way a real engine behaves,
+because the suite fails if they do not. A fake that quietly diverges is worse than no fake,
+since the tests it passes stop meaning anything.
+
+What it does not model, and does not pretend to: isolation levels, concurrent writers, and
+anything about how a real engine schedules work. Use it to test your logic, not your
+database. `npm run example:memory-testing` shows a service tested end to end this way.
+
 ## Adapters and conformance
 
-Both adapters run one shared test suite, exported as `repolayer/testing`. That is what
-turns "the two backends behave identically" from a hope into something checked on every
-commit, and it is available to third-party adapters too:
+Every adapter runs one shared test suite, exported as `repolayer/testing`. That is what
+turns "the backends behave identically" from a hope into something checked on every commit,
+and it is available to third-party adapters too:
 
 ```ts
 import { runConformanceSuite } from 'repolayer/testing';
@@ -225,15 +390,31 @@ runConformanceSuite({
 ```bash
 npm run build       # ESM + CJS + type declarations
 npm run typecheck   # tsc --noEmit
-npm test            # unit tests plus the SQLite conformance suite, no setup needed
-npm run test:pg     # starts Postgres in docker compose and runs the full suite
-npm run example:swap  # runs the same logic on both drivers and diffs the output
+npm run lint        # eslint + prettier --check
+npm test            # unit tests, plus SQLite and MemoryRepo conformance. No setup needed.
+npm run bench       # benchmarks, compared against bench/BASELINE.md
+
+npm run test:pg       # starts Postgres in docker compose and runs the full suite
+npm run test:mysql    # the same, against MySQL
+npm run test:mariadb  # the same, against MariaDB
+npm run test:all      # every engine at once
+npm run db:down       # stops them and removes the volumes
+
+npm run example:swap            # the same logic on every engine, output diffed
+npm run example:stream-export   # cursors, early exit, and cancellation
+npm run example:paging-api      # keyset paging against offset paging, under writes
+npm run example:memory-testing  # a service unit-tested with no database
 ```
 
-`npm test` runs everything that needs no external service. The Postgres conformance tests
-skip with a message unless `TEST_DATABASE_URL` is set. CI always sets it, against a
-Postgres service container, and fails the build if that half of the suite skips, so
-"passing" never quietly means SQLite only.
+`npm test` runs everything that needs no external service, which is the unit tests plus two
+full conformance runs: SQLite and `MemoryRepo`. The Postgres, MySQL, and MariaDB suites skip
+with a message unless their `TEST_*_URL` is set.
+
+CI always sets all three, against service containers, and then reads the test report back
+and fails the build if any engine's suite skipped instead of running. "Passing" can never
+quietly mean SQLite only. The `test:*` scripts start the containers for you, or point at a
+server you already have by exporting the variable yourself; without Docker they say so
+rather than failing obscurely.
 
 ## Releasing
 

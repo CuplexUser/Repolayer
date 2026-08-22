@@ -16,5 +16,5 @@
     "noEmit": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "test", "examples", "scripts", "*.ts"]
+  "include": ["src", "test", "bench", "examples", "scripts", "*.ts"]
 }

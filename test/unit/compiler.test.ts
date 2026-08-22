@@ -6,6 +6,7 @@ import {
   compileCount,
   compileSelect,
   type FieldFilter,
+  type Filter,
   type QueryOptions,
 } from '../../src/core/query.js';
 import { createTableStatements } from '../../src/core/ddl.js';
@@ -157,12 +158,12 @@ describe('compileSelect', () => {
   });
 
   it('requires an array for in and nin, and a string for like', () => {
-    expect(() =>
-      select({ where: [{ field: 'name', op: 'in', value: 'a' }] }, 'sqlite'),
-    ).toThrow(QueryError);
-    expect(() =>
-      select({ where: [{ field: 'name', op: 'like', value: 5 }] }, 'sqlite'),
-    ).toThrow(QueryError);
+    expect(() => select({ where: [{ field: 'name', op: 'in', value: 'a' }] }, 'sqlite')).toThrow(
+      QueryError,
+    );
+    expect(() => select({ where: [{ field: 'name', op: 'like', value: 5 }] }, 'sqlite')).toThrow(
+      QueryError,
+    );
   });
 });
 
@@ -232,5 +233,155 @@ describe('createTableStatements', () => {
     expect(() => createTableStatements(schema, 'widgets; DROP TABLE users', 'sqlite')).toThrow(
       SchemaError,
     );
+  });
+});
+
+describe('createTableStatements defaults', () => {
+  it('emits a quoted default for a string and escapes an embedded quote', () => {
+    const withDefaults = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      label: { type: 'string', default: "it's fine" },
+    });
+    const [sql] = createTableStatements(withDefaults, 't', 'sqlite');
+    expect(sql).toContain("label TEXT NOT NULL DEFAULT 'it''s fine'");
+  });
+
+  it('emits numeric and boolean defaults per dialect', () => {
+    const withDefaults = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      quantity: { type: 'integer', default: 0 },
+      active: { type: 'boolean', default: true },
+    });
+
+    const [sqlite] = createTableStatements(withDefaults, 't', 'sqlite');
+    // SQLite has no boolean type, so the default has to be written the way the column
+    // stores it, or the stored default would not round trip as a boolean.
+    expect(sqlite).toContain('quantity INTEGER NOT NULL DEFAULT 0');
+    expect(sqlite).toContain('active INTEGER NOT NULL DEFAULT 1');
+
+    const [postgres] = createTableStatements(withDefaults, 't', 'postgres');
+    expect(postgres).toContain('active BOOLEAN NOT NULL DEFAULT true');
+  });
+
+  it('emits an ISO literal for a Date default and JSON for a json default', () => {
+    const withDefaults = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      at: { type: 'date', default: new Date('2024-02-03T04:05:06.007Z') },
+      meta: { type: 'json', default: { a: [1, 2] } },
+    });
+    const [sql] = createTableStatements(withDefaults, 't', 'postgres');
+    expect(sql).toContain("DEFAULT '2024-02-03T04:05:06.007Z'");
+    expect(sql).toContain('DEFAULT \'{"a":[1,2]}\'');
+  });
+
+  it('emits NULL for an explicitly null default', () => {
+    const withDefaults = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      note: { type: 'string', nullable: true, default: null },
+    });
+    const [sql] = createTableStatements(withDefaults, 't', 'sqlite');
+    expect(sql).toContain('note TEXT DEFAULT NULL');
+  });
+
+  it('refuses an object default on a non-json column instead of stringifying it', () => {
+    // String(value) here would emit DEFAULT '[object Object]', which is a silently wrong
+    // table rather than an error.
+    const bad = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      label: { type: 'string', default: { oops: true } },
+    });
+    expect(() => createTableStatements(bad, 't', 'sqlite')).toThrow(SchemaError);
+  });
+});
+
+describe('filter trees', () => {
+  it('compiles an or group with parentheses so precedence cannot slip', () => {
+    const { sql, params } = select(
+      {
+        where: [
+          { field: 'active', op: 'eq', value: true },
+          {
+            or: [
+              { field: 'quantity', op: 'gt', value: 10 },
+              { field: 'name', op: 'eq', value: 'Anvil' },
+            ],
+          },
+        ],
+      },
+      'postgres',
+    );
+    expect(sql).toContain('WHERE active = $1 AND (quantity > $2 OR name = $3)');
+    expect(params).toEqual([true, 10, 'Anvil']);
+  });
+
+  it('compiles nested and inside or', () => {
+    const { sql } = select(
+      {
+        where: [
+          {
+            or: [
+              {
+                and: [
+                  { field: 'active', op: 'eq', value: true },
+                  { field: 'quantity', op: 'lt', value: 5 },
+                ],
+              },
+              { field: 'name', op: 'eq', value: 'x' },
+            ],
+          },
+        ],
+      },
+      'sqlite',
+    );
+    expect(sql).toContain('WHERE ((active = ? AND quantity < ?) OR name = ?)');
+  });
+
+  it('does not parenthesize a group of one, which needs no grouping', () => {
+    const { sql } = select(
+      { where: [{ or: [{ field: 'name', op: 'eq', value: 'x' }] }] },
+      'sqlite',
+    );
+    expect(sql).toContain('WHERE name = ?');
+  });
+
+  it('collapses an empty group to a constant rather than invalid SQL', () => {
+    expect(select({ where: [{ or: [] }] }, 'sqlite').sql).toContain('WHERE 1 = 0');
+    expect(select({ where: [{ and: [] }] }, 'sqlite').sql).toContain('WHERE 1 = 1');
+  });
+
+  it('binds parameters in the order they are written, on both dialects', () => {
+    const query: QueryOptions<Row> = {
+      where: [
+        {
+          or: [
+            { field: 'quantity', op: 'in', value: [1, 2] },
+            {
+              and: [
+                { field: 'name', op: 'like', value: 'a%' },
+                { field: 'active', op: 'eq', value: false },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(select(query, 'sqlite').params).toEqual([1, 2, 'a%', 0]);
+    expect(select(query, 'postgres').params).toEqual([1, 2, 'a%', false]);
+  });
+
+  it('refuses a tree nested past the depth limit', () => {
+    let node: Filter<Row> = { field: 'name', op: 'eq', value: 'x' };
+    for (let i = 0; i < 20; i += 1) node = { and: [node] };
+    expect(() => select({ where: [node] }, 'sqlite')).toThrow(QueryError);
+  });
+
+  it('still rejects an unknown field inside a group', () => {
+    const bad = { field: 'nope', op: 'eq', value: 1 } as unknown as FieldFilter<Row>;
+    expect(() => select({ where: [{ or: [bad] }] }, 'sqlite')).toThrow(QueryError);
+  });
+
+  it('rejects a filter node that is neither a group nor a field comparison', () => {
+    const bad = { field: 'name' } as unknown as FieldFilter<Row>;
+    expect(() => select({ where: [bad] }, 'sqlite')).toThrow(QueryError);
   });
 });

@@ -3,7 +3,6 @@ import path from 'node:path';
 
 import {
   BaseRepo,
-  TX_EXECUTOR,
   type BaseRepoOptions,
   type Executor,
   type InternalTxContext,
@@ -34,6 +33,15 @@ export interface SqliteRepoOptions extends Omit<BaseRepoOptions, 'ids' | 'timest
  * connection. Opening a second connection to the same file would not just waste a handle,
  * it would make `repo.with(ctx)` impossible between two repos on the same database.
  */
+/**
+ * How many prepared statements one connection keeps.
+ *
+ * The cache is keyed by SQL text, and an `in` filter produces a different statement for
+ * every array length, so a varied workload generates unboundedly many distinct keys. An
+ * unbounded Map here is a memory leak in a long-running process, not just a large cache.
+ */
+const STATEMENT_CACHE_LIMIT = 200;
+
 export class SqliteConnection {
   readonly id = Symbol('repolayer.sqlite');
   private readonly statements = new Map<string, StatementSync>();
@@ -72,29 +80,63 @@ export class SqliteConnection {
     return connection;
   }
 
-  /** Prepared statements are cached: the same SQL is re-run constantly. */
+  /**
+   * A statement outside the cache, for a cursor.
+   *
+   * A cached statement is a single object with one iteration position, so two streams over
+   * the same SQL, or a stream and a plain query, would step on each other. A cursor gets
+   * its own statement and drops it when the iteration ends.
+   */
+  prepareUncached(sql: string): StatementSync {
+    if (this.closed) {
+      throw new ConnectionError('This SQLite connection is already closed');
+    }
+    return this.db.prepare(sql);
+  }
+
+  /**
+   * Prepared statements are cached, because the same SQL is re-run constantly.
+   *
+   * Bounded, and least-recently-used: a Map iterates in insertion order, so re-inserting on
+   * a hit moves an entry to the end and the first key is always the coldest one.
+   */
   prepare(sql: string): StatementSync {
-    let statement = this.statements.get(sql);
-    if (statement === undefined) {
-      statement = this.db.prepare(sql);
-      this.statements.set(sql, statement);
+    const cached = this.statements.get(sql);
+    if (cached !== undefined) {
+      this.statements.delete(sql);
+      this.statements.set(sql, cached);
+      return cached;
+    }
+
+    const statement = this.db.prepare(sql);
+    this.statements.set(sql, statement);
+    if (this.statements.size > STATEMENT_CACHE_LIMIT) {
+      const oldest = this.statements.keys().next();
+      if (!oldest.done) this.statements.delete(oldest.value);
     }
     return statement;
   }
 
-  get executor(): Executor {
-    const connection = this;
-    return {
-      async query(sql: string, params: unknown[]): Promise<Record<string, unknown>[]> {
-        if (connection.closed) {
-          throw new ConnectionError('This SQLite connection is already closed');
-        }
-        // node:sqlite is synchronous. It is wrapped in the async interface rather than
-        // made async, so behavior matches Postgres without pretending there is IO here.
-        return connection.prepare(sql).all(...(params as never[])) as Record<string, unknown>[];
-      },
-    };
+  /** How many statements are cached. Exposed so the bound can be tested. */
+  get cachedStatements(): number {
+    return this.statements.size;
   }
+
+  /**
+   * Built once per connection rather than rebuilt per call. `defaultExecutor()` runs on
+   * every single query, and a getter returning a fresh object literal allocates a closure
+   * each time for an object that never varies.
+   */
+  readonly executor: Executor = {
+    query: async (sql: string, params: unknown[]): Promise<Record<string, unknown>[]> => {
+      if (this.closed) {
+        throw new ConnectionError('This SQLite connection is already closed');
+      }
+      // node:sqlite is synchronous. It is wrapped in the async interface rather than
+      // made async, so behavior matches Postgres without pretending there is IO here.
+      return this.prepare(sql).all(...(params as never[]));
+    },
+  };
 
   close(): void {
     if (this.closed) return;
@@ -165,6 +207,41 @@ export class SqliteRepo<T, ID = string> extends BaseRepo<T, ID> {
     release: () => void;
   }> {
     return { executor: this.connection.executor, release: () => undefined };
+  }
+
+  /**
+   * `StatementSync.iterate()` steps the statement row by row rather than materializing the
+   * result, which is the whole point. It is yielded in batches so the async interface does
+   * not pay a microtask per row.
+   *
+   * SQLite holds a read lock for as long as the statement is stepping, so the `finally`
+   * matters: an abandoned iterator would keep that lock until garbage collection, and on a
+   * single-writer engine that blocks every writer.
+   */
+  protected override async *openCursor(
+    sql: string,
+    params: unknown[],
+    batchSize: number,
+  ): AsyncIterable<Record<string, unknown>[]> {
+    const statement = this.connection.prepareUncached(sql);
+    const iterator = statement.iterate(...(params as never[])) as Iterator<Record<string, unknown>>;
+    try {
+      let batch: Record<string, unknown>[] = [];
+      for (;;) {
+        const next = iterator.next();
+        if (next.done === true) break;
+        batch.push(next.value);
+        if (batch.length >= batchSize) {
+          yield batch;
+          batch = [];
+        }
+      }
+      if (batch.length > 0) yield batch;
+    } finally {
+      // Resets the statement and releases the read lock. Reached on a consumer break too:
+      // closing this generator runs the finally.
+      iterator.return?.();
+    }
   }
 
   protected override mapError(error: unknown): unknown {

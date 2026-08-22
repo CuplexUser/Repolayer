@@ -6,6 +6,8 @@
     "repository",
     "sqlite",
     "postgres",
+    "mysql",
+    "mariadb",
     "database",
     "abstraction",
     "adapter"
@@ -60,6 +62,26 @@
         "default": "./dist/postgres/index.cjs"
       }
     },
+    "./mysql": {
+      "import": {
+        "types": "./dist/mysql/index.d.ts",
+        "default": "./dist/mysql/index.js"
+      },
+      "require": {
+        "types": "./dist/mysql/index.d.cts",
+        "default": "./dist/mysql/index.cjs"
+      }
+    },
+    "./memory": {
+      "import": {
+        "types": "./dist/memory/index.d.ts",
+        "default": "./dist/memory/index.js"
+      },
+      "require": {
+        "types": "./dist/memory/index.d.cts",
+        "default": "./dist/memory/index.cjs"
+      }
+    },
     "./testing": {
       "import": {
         "types": "./dist/testing/index.d.ts",
@@ -74,19 +96,32 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "pg:up": "docker compose up -d --wait",
-    "pg:down": "docker compose down -v",
-    "test:pg": "npm run pg:up && node scripts/test-pg.mjs",
+    "bench": "vitest bench --run",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down -v",
+    "test:pg": "node scripts/test-db.mjs postgres",
+    "test:mysql": "node scripts/test-db.mjs mysql",
+    "test:mariadb": "node scripts/test-db.mjs mariadb",
+    "test:all": "node scripts/test-db.mjs postgres mysql mariadb",
     "example:swap": "npm run build && node --experimental-strip-types examples/swap/index.ts",
+    "example:stream-export": "npm run build && node --experimental-strip-types examples/stream-export/index.ts",
+    "example:paging-api": "npm run build && node --experimental-strip-types examples/paging-api/index.ts",
+    "example:memory-testing": "npm run build && node --experimental-strip-types examples/memory-testing/index.ts",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
+    "mysql2": "^3.9.0",
     "pg": "^8.11.0",
     "vitest": ">=1"
   },
   "peerDependenciesMeta": {
+    "mysql2": {
+      "optional": true
+    },
     "pg": {
       "optional": true
     },
@@ -95,11 +130,18 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "@vitest/coverage-v8": "^4.1.11",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^10.1.8",
+    "mysql2": "^3.23.4",
     "pg": "^8.13.1",
-    "tsdown": "^0.9.6",
+    "prettier": "^3.9.6",
+    "tsdown": "^0.22.14",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.11"
   }
 }

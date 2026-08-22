@@ -24,9 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         # `node:sqlite` needs --experimental-sqlite below 23.4 and is only stable from 24,
-        # so the SQLite adapter is exercised on 24 and up. The core and Postgres paths run
-        # fine on older releases, which is what engines.node reflects.
-        node: ['24', '26']
+        # so 22 passes the flag. It is in the matrix because engines.node claims support
+        # from 22.5, and a claim nothing runs against is a guess.
+        node: ['22', '24', '26']
 
     services:
       postgres:
@@ -43,10 +43,45 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: repolayer
+          MYSQL_USER: repolayer
+          MYSQL_PASSWORD: repolayer
+          MYSQL_DATABASE: repolayer
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -urepolayer -prepolayer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: repolayer
+          MARIADB_USER: repolayer
+          MARIADB_PASSWORD: repolayer
+          MARIADB_DATABASE: repolayer
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
     env:
-      # Setting this is what un-skips the Postgres half of the conformance suite. Locally
-      # it is usually absent and those tests skip with a message; in CI they always run.
+      # Setting these is what un-skips each engine's half of the conformance suite. Locally
+      # they are usually absent and those tests skip with a message; in CI they always run,
+      # and the step after the tests fails the build if any of them did not.
       TEST_DATABASE_URL: postgres://repolayer:repolayer@localhost:5432/repolayer
+      TEST_MYSQL_URL: mysql://repolayer:repolayer@127.0.0.1:3306/repolayer
+      TEST_MARIADB_URL: mysql://repolayer:repolayer@127.0.0.1:3307/repolayer
+      # `node:sqlite` is behind a flag before 23.4.
+      NODE_OPTIONS: ${{ matrix.node == '22' && '--experimental-sqlite' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -58,39 +93,45 @@ jobs:
 
       - run: npm ci
 
+      - name: Lint
+        run: npm run lint
+
       - name: Build
-        # Must precede the typecheck: examples/swap imports the built package from dist/
-        # on purpose, so that the example also verifies the generated .d.ts files are
-        # usable. On a clean runner there is no dist/ until this step runs.
+        # Must precede the typecheck: examples/ import the built package from dist/ on
+        # purpose, so the examples also verify the generated .d.ts files are usable. On a
+        # clean runner there is no dist/ until this step runs.
         run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test (unit, SQLite conformance, and Postgres conformance)
-        run: npx vitest run
+      - name: Test every engine
+        # One run, one report. The engine assertion below reads that report rather than
+        # re-running a suite, which used to cost a second full pass over the databases.
+        run: npx vitest run --reporter=json --outputFile=report.json --reporter=default
 
-      - name: Fail if the Postgres conformance suite did not actually run
-        # The suite skips itself when TEST_DATABASE_URL is missing. A silent skip in CI
-        # would quietly reduce this to SQLite-only coverage, which is exactly the failure
-        # this workflow exists to prevent.
+      - name: Fail if any engine's conformance suite did not actually run
         run: |
-          npx vitest run test/postgres.test.ts --reporter=json --outputFile=pg-report.json
-          node -e "
-            const fs = require('node:fs');
-            const r = JSON.parse(fs.readFileSync('pg-report.json', 'utf8'));
-            const total = r.numTotalTests ?? 0;
-            const passed = r.numPassedTests ?? 0;
-            if (total === 0 || passed === 0) {
-              console.error('Postgres conformance suite did not run. Check TEST_DATABASE_URL.');
-              process.exit(1);
-            }
-            console.log('Postgres conformance:', passed + '/' + total, 'passed');
-          "
+          node scripts/assert-engines-ran.mjs report.json \
+            test/postgres.test.ts \
+            test/mysql.test.ts \
+            test/mariadb.test.ts \
+            test/sqlite.test.ts \
+            test/memory.test.ts
+
+      - name: Coverage
+        if: matrix.node == '24'
+        run: npx vitest run --coverage
 
       - name: Prove the driver swap produces identical output
-        # The package's central claim, executed against both engines for real.
-        run: node --experimental-strip-types examples/swap/index.ts
+        # The package's central claim, executed against every engine for real.
+        run: npm run example:swap
+
+      - name: Run the remaining examples
+        run: |
+          npm run example:stream-export
+          npm run example:paging-api
+          npm run example:memory-testing
 
   package:
     name: package
@@ -108,7 +149,8 @@ jobs:
 
       - name: Pack and install into a scratch consumer
         # Catches export-map and type-resolution breakage that only shows up once the
-        # package is installed, and confirms the SQLite path works with `pg` absent.
+        # package is installed, and confirms the SQLite path works with `pg` and `mysql2`
+        # both absent.
         run: |
           set -euo pipefail
           npm pack --pack-destination /tmp
@@ -119,6 +161,8 @@ jobs:
           cat > esm.mjs <<'EOF'
           import { createRepo, defineSchema } from 'repolayer';
           import { SqliteRepo } from 'repolayer/sqlite';
+          import { MysqlRepo } from 'repolayer/mysql';
+          import { MemoryRepo } from 'repolayer/memory';
           import assert from 'node:assert/strict';
           const schema = defineSchema({
             id: { type: 'string', primaryKey: true },
@@ -130,7 +174,21 @@ jobs:
           });
           const row = await repo.create({ name: 'esm' });
           assert.equal((await repo.findById(row.id)).name, 'esm');
+
+          // The capabilities added since v1, exercised through the published entry points.
+          const page = await repo.findPage(undefined, { limit: 10 });
+          assert.equal(page.items.length, 1);
+          const streamed = [];
+          for await (const r of repo.stream()) streamed.push(r);
+          assert.equal(streamed.length, 1);
+          assert.equal(await repo.updateMany(undefined, { name: 'renamed' }), 1);
+
+          const memory = new MemoryRepo({ table: 't', schema });
+          await memory.create({ name: 'in memory' });
+          assert.equal((await memory.count()), 1);
+
           assert.equal(typeof SqliteRepo, 'function');
+          assert.equal(typeof MysqlRepo, 'function');
           await repo.close();
           console.log('ESM consumer ok');
           EOF

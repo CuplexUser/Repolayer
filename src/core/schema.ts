@@ -36,9 +36,8 @@ type Nullable<F extends FieldDef, V> = F extends { nullable: true } ? V | null :
  * The row type a schema describes. `nullable: true` fields widen to include `null`,
  * so the compiler tells you where to handle absent values.
  */
-export type Infer<S> = S extends Schema<infer F>
-  ? { [K in keyof F]: Nullable<F[K], FieldValue<F[K]>> }
-  : never;
+export type Infer<S> =
+  S extends Schema<infer F> ? { [K in keyof F]: Nullable<F[K], FieldValue<F[K]>> } : never;
 
 /** The insert shape: the primary key is optional when the adapter generates it. */
 export type CreateInput<T, IdKey extends keyof T = keyof T> = Omit<T, IdKey> &
@@ -65,14 +64,7 @@ export interface Schema<F extends FieldMap = any> {
   readonly types: Readonly<Record<string, FieldType>>;
 }
 
-const VALID_TYPES = new Set<string>([
-  'string',
-  'number',
-  'integer',
-  'boolean',
-  'date',
-  'json',
-]);
+const VALID_TYPES = new Set<string>(['string', 'number', 'integer', 'boolean', 'date', 'json']);
 
 /**
  * Validates a field map and precomputes the lookup tables both adapters use.

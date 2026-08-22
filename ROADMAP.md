@@ -1,126 +1,119 @@
 # Roadmap
 
-What is shipped, what is coming, and what is deliberately never coming. Items are listed
-in the order they are expected to land.
+What is shipped, what is coming, and what is deliberately never coming.
 
-## v1.0, shipped
+## Versioning
+
+Everything under "Shipped" lands in `1.0.0`, the first stable release. Earlier drafts of
+this file numbered the milestones `v1.0`, `v1.1` and so on, which read as released versions
+that did not exist on npm, so the milestones are named by what they contain instead.
+
+`1.0.0` is a major bump rather than a minor one because `Repo<T>` grew three methods,
+`stream`, `findPage`, and `updateMany`, and `Dialect` grew two members. Neither breaks
+application code, but both break any third-party adapter that implements the interface
+directly, and the whole premise of the conformance suite is that such adapters exist.
+
+## Shipped
+
+### The contract
 
 The `Repo<T>` interface, `QueryOptions` with the eleven operators, the schema descriptor,
-SQLite and Postgres adapters, transactions with savepoints, `ensureTable()`, id and
-timestamp strategies, and the shared conformance suite that both adapters pass.
+transactions with savepoints, `ensureTable()`, id and timestamp strategies, and the shared
+conformance suite that every adapter passes.
 
-## v1.1, cursors
+### Adapters
 
-The one substantial capability deliberately deferred out of v1. "Cursor" covers both
-senses the package needs, and they share a design, so they ship together.
+SQLite (`node:sqlite`), Postgres (`pg`), MySQL and MariaDB (`mysql2`), and an in-memory
+`MemoryRepo`. All four pass the same suite, which is the only reason the claim that they
+behave identically means anything.
 
-### Streaming cursors: `repo.stream(query)`
+### Cursors
 
-Returns an `AsyncIterable<T>` that pulls rows in batches instead of materializing the whole
-result set, so a table larger than memory can be exported, migrated, or re-indexed.
+Both senses the package needs, sharing one design.
 
-```ts
-for await (const row of repo.stream({ where: { status: 'queued' } })) {
-  await handle(row);
-}
-```
+**`repo.stream(query, opts)`** returns an `AsyncIterable<T>` that pulls rows in batches
+rather than materializing the result set. A real server-side cursor on Postgres
+(`DECLARE` plus repeated `FETCH FORWARD`), a stepped statement on SQLite
+(`StatementSync.iterate()`), and a batched replay on MySQL, which has no server-side cursor
+for a plain SELECT.
 
-Per engine:
+The hard part, and the reason it was deferred out of the first release, was resource
+lifetime rather than iteration. What the contract now guarantees:
 
-- **Postgres**: a real server-side cursor. `DECLARE ... CURSOR` inside a transaction, then
-  repeated `FETCH FORWARD n`, using `pg-cursor` when it is installed and a hand-rolled
-  DECLARE/FETCH otherwise. Rows never all arrive at the client, which is the entire point.
-- **SQLite**: `StatementSync.iterate()` from `node:sqlite`, which steps the statement row by
-  row, yielded in batches so the async interface does not pay a microtask per row.
+- A consumer `break`, `return`, or `throw` closes the cursor and ends the transaction it
+  opened, because every adapter implements it as an async generator whose `finally` does
+  the closing.
+- An abandoned iterator does not leak a pooled Postgres client. The suite asserts the pool
+  returns to its baseline after an early break, through an optional `busyConnections()`
+  hook an adapter can provide.
+- Writes performed inside the loop join the cursor's transaction, by streaming from a
+  transaction-bound repo. No second API was needed for this.
+- An `AbortSignal` cancels from outside the loop, throwing the reason the caller gave.
+- Long-running cursors interact badly with SQLite's single-writer model, and the docs say
+  so plainly rather than implying otherwise.
 
-The hard part, and the reason this is not in v1, is **resource lifetime**. A cursor holds
-an open transaction on Postgres and a read lock on SQLite, so the contract has to be
-airtight:
+**`repo.findPage(query, opts)`** is keyset pagination with an opaque, stateless token. The
+token encodes the sort-key values of the last row, and the next page compiles to a keyset
+predicate rather than an `OFFSET`, so paging stays correct as rows are inserted underneath
+it and stays fast at any depth. Tokens carry a version tag and a fingerprint of the sort
+they were minted under, so a stale or mismatched token fails loudly instead of silently
+paging wrong.
 
-- A consumer `break`, `return`, or `throw` inside `for await` must close the cursor and end
-  the transaction. That means implementing `AsyncIterator.return()`, not just `next()`.
-- An abandoned iterator must not leak a pooled Postgres client. The suite asserts the pool
-  returns to its baseline size after an early break.
-- Writes performed inside the loop must be able to join the cursor's own transaction, so
-  `stream` exposes the same `TxContext` that `withTransaction` does.
-- Long-running cursors interact badly with SQLite's single-writer model. Holding one open
-  across slow work blocks writers, and the docs will say so plainly.
-- An `AbortSignal` option, so a cursor can be cancelled from outside the loop.
+Deviation from the original plan: **`pg-cursor` is not used**, even optionally. The
+hand-rolled DECLARE/FETCH path has to exist and be tested regardless, and a second optional
+peer dependency would have bought a code path exercised only on the machines that happen to
+have it installed.
 
-### Keyset pagination cursors: `repo.findPage(query, opts)`
+### Ergonomics
 
-An opaque, stateless cursor token for API-style paging. Unlike the streaming cursor it
-holds no connection between requests.
+- `OR` groups and nested filter trees in `QueryOptions`, still plain serializable JSON,
+  with a depth cap so a filter arriving from a request cannot compile to unbounded SQL.
+- `updateMany` taking a `QueryOptions` predicate, to match `deleteMany`. It reports rows
+  matched rather than rows changed, so the number depends on the filter rather than on the
+  data.
+- `MemoryRepo`, exported from `repolayer/memory`, for unit tests with no database at all.
+  It passes the conformance suite, which is what separates it from a fake that quietly
+  diverges.
 
-```ts
-const page = await repo.findPage(
-  { orderBy: [{ field: 'createdAt', direction: 'desc' }] },
-  { limit: 50, after: previousPage.cursor },
-);
-// { items: T[], cursor: string | null, hasMore: boolean }
-```
+### MySQL and MariaDB, in detail
 
-The token encodes the sort-key values of the last row, and the next page compiles to a
-keyset predicate in row-comparison form rather than `OFFSET`, so paging stays correct and
-fast as rows are inserted underneath it. Deferred from v1 because correctness across
-mixed-direction sorts and nullable sort keys is genuinely fiddly, and it depends on the
-explicit `NULLS FIRST` / `NULLS LAST` normalization v1 establishes. Tokens carry a version
-tag so a token from an older deployment fails loudly instead of silently paging wrong.
+One dialect, with the flavor detected at connect. Almost all of the work landed in the
+normalization layer that already existed:
 
-### Conformance additions
-
-Both cursor forms get suite cases that must pass identically on every driver: a full
-traversal yields exactly `findMany()` in the same order, `batchSize` does not affect
-results, an early break closes cleanly and leaks no connection, a concurrent insert during
-traversal neither duplicates nor skips already-returned rows under keyset paging, empty
-result sets terminate immediately, and `findPage` walked to exhaustion reconstructs the
-full ordered set with no gaps or repeats.
-
-## v1.2, ergonomics
-
-- `OR` groups and nested filter trees in `QueryOptions`, kept serializable.
-- A `MemoryRepo` in `repolayer/testing` that also passes the conformance suite, for unit
-  tests with no database at all.
-- `updateMany` taking a `QueryOptions` predicate, to match `deleteMany`.
-
-## v2.0, more engines
-
-Adding an engine is the real test of whether the abstraction holds, because the conformance
-suite is the contract and a new adapter either passes it or does not. Two are planned, in
-this order.
-
-### MySQL and MariaDB (`mysql2`)
-
-The closer port, since it is another SQL dialect behind the same compiler. Almost all the
-work lands in the normalization layer v1 already established:
-
-- Placeholders are `?`, as in SQLite, so the compiler needs no third placeholder style.
-- `RETURNING` does not exist, so `create` and `update` become an INSERT or UPDATE followed
-  by a keyed SELECT on the same connection, inside a transaction where one is not already
-  open.
-- Collation decides `LIKE` case sensitivity, so `like` must force a binary collation and
-  `ilike` a case-insensitive one, rather than trusting the server or table default. Same
-  class of problem as SQLite's `case_sensitive_like` pragma, solved in the same place.
+- Placeholders are `?`, as in SQLite, so the compiler needed no third placeholder style.
+- `RETURNING` does not exist, so `create` and `update` are an INSERT or UPDATE followed by
+  a keyed SELECT on the same connection, inside a transaction where one is not already
+  open. `BaseRepo` owns that choreography behind a `supportsReturning` flag, so the two
+  paths cannot drift apart.
+- Collation decides `LIKE` case sensitivity, so `like` forces a binary collation and
+  `ilike` lowers both sides, rather than trusting the server or table default. Same class
+  of problem as SQLite's `case_sensitive_like` pragma, solved in the same place.
 - There is no `NULLS FIRST` / `NULLS LAST` syntax, so ordering compiles to an
-  `ORDER BY (col IS NULL) ASC|DESC, col` prefix to reproduce the normalized position.
+  `ORDER BY (col IS NULL) ASC|DESC, col` prefix that reproduces the normalized position.
 - `boolean` is `TINYINT(1)`, `date` is `DATETIME(6)` written explicitly in UTC, and `json`
-  is the native `JSON` type.
-- Unique violations arrive as error `1062`, mapped to `UniqueConstraintError`.
+  is the native `JSON` type, read as raw text on both flavors so one parse path serves
+  both.
+- Unique violations arrive as error `1062`, in two different message shapes, mapped to
+  `UniqueConstraintError` naming the schema field.
+
+## Next
 
 ### MongoDB (`mongodb`)
 
-The more interesting one, and the one that proves restricting the query shape was worth
-it. `QueryOptions` maps almost directly onto a Mongo `find`, with no SQL involved:
+The interesting one, and the one that would prove restricting the query shape was worth it.
+`QueryOptions` maps almost directly onto a Mongo `find`, with no SQL involved:
 `eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in`/`nin` are already the `$` operator names, `orderBy`
-becomes `sort`, and `limit`/`offset` become `limit`/`skip`. That the same interface
-compiles to both SQL and a document query without widening is the strongest available
-evidence this is not just a SQL builder wearing a disguise.
+becomes `sort`, and `limit`/`offset` become `limit`/`skip`.
 
-Where it genuinely differs, and how each is handled:
+`MemoryRepo` has since made a weaker version of that argument already, by satisfying the
+same interface with no SQL anywhere. Mongo would make it against a real engine.
+
+Where it genuinely differs, and how each would be handled:
 
 - `like` and `ilike` compile to anchored `$regex`, with `%` and `_` translated to `.*` and
   `.`, and every other regex metacharacter escaped. Anything less would let a filter value
-  become executable, which is the injection problem in a different costume.
+  become executable, which is the injection problem in a different costume. `MemoryRepo`
+  already does exactly this translation, so the logic exists.
 - The primary key maps to `_id`, projected back to the schema's declared field on read and
   written on create, so application code keeps seeing `id`.
 - `unique: true` becomes a unique index created by `ensureCollection()`, the counterpart of
@@ -130,6 +123,8 @@ Where it genuinely differs, and how each is handled:
   `ConnectionError` explaining the requirement rather than silently running without
   atomicity. The suite already supports declaring a capability unsupported with a stated
   reason, so this becomes documented behavior rather than a quiet skip.
+- Keyset paging needs the same lexicographic expansion the SQL adapters use, which now
+  lives in `src/core/keyset.ts` and is engine-independent, so it should port unchanged.
 - Null ordering, decimal precision, and the absence of a fixed schema are all pinned down
   by the existing type round-trip cases, which is exactly why those cases assert on values
   rather than on generated SQL.
@@ -141,6 +136,9 @@ publishing, not a reason to loosen the suite.
 
 - Further adapters: Cloudflare D1, libSQL/Turso, and an HTTP adapter, once the suite is
   proven to be a sufficient contract for adapters written by other people.
+- A server-side streaming path for MySQL. `mysql2` can stream, but only through its
+  callback API, and wiring that up means a second cursor lifetime to get right. Today
+  `stream` is correct there but does not reduce peak memory, and that is documented.
 
 ## Never
 
@@ -151,5 +149,9 @@ publishing, not a reason to loosen the suite.
   the README.
 - **Raw SQL passthrough on the `Repo` interface.** Dialect-specific SQL is fine and
   sometimes necessary, but it belongs in one clearly marked place using the driver
-  directly, not smuggled through an interface whose entire promise is that both engines
-  behave the same.
+  directly, not smuggled through an interface whose entire promise is that every engine
+  behaves the same.
+- **Quoted identifiers.** They would allow reserved words as column names, but Postgres
+  folds unquoted identifiers to lowercase, so quoting them would make `createdAt` refer to
+  a different column than every existing table has. A documented limitation beats a silent
+  break.

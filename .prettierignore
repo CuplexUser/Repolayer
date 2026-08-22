@@ -1,0 +1,8 @@
+dist
+coverage
+node_modules
+package-lock.json
+*.tgz
+# Markdown is hand formatted: the code samples use deliberate column alignment that
+# Prettier would flatten, and the prose is wrapped by hand.
+*.md

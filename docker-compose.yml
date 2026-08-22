@@ -1,4 +1,10 @@
-# Postgres for `npm run test:pg`. Port 54329 avoids colliding with a local 5432.
+# Local databases for the conformance suite. Ports are offset from the defaults so they do
+# not collide with an engine already installed on the machine.
+#
+#   npm run test:pg        Postgres only
+#   npm run test:mysql     MySQL only
+#   npm run test:mariadb   MariaDB only
+#   npm run test:all       every engine at once
 services:
   postgres:
     image: postgres:17-alpine
@@ -13,3 +19,41 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: repolayer
+      MYSQL_USER: repolayer
+      MYSQL_PASSWORD: repolayer
+      MYSQL_DATABASE: repolayer
+    ports:
+      - '33069:3306'
+    # utf8mb4 throughout: the adapter forces a binary collation on `like`, and forcing one
+    # onto a latin1 column is an error rather than a comparison.
+    command: >-
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1', '-urepolayer', '-prepolayer']
+      interval: 2s
+      timeout: 5s
+      retries: 45
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: repolayer
+      MARIADB_USER: repolayer
+      MARIADB_PASSWORD: repolayer
+      MARIADB_DATABASE: repolayer
+    ports:
+      - '33070:3306'
+    command: >-
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_general_ci
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 2s
+      timeout: 5s
+      retries: 45

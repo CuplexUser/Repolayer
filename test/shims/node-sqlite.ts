@@ -13,7 +13,4 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const sqlite = require('node:sqlite') as { DatabaseSync: unknown };
 
-export const DatabaseSync = sqlite.DatabaseSync as new (
-  path: string,
-  options?: unknown,
-) => unknown;
+export const DatabaseSync = sqlite.DatabaseSync as new (path: string, options?: unknown) => unknown;

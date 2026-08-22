@@ -20,9 +20,7 @@ runConformanceSuite({
       schema: options.schema,
       connection,
       ids: options.ids ?? 'uuid',
-      timestamps: options.timestamps
-        ? { createdAt: 'createdAt', updatedAt: 'updatedAt' }
-        : {},
+      timestamps: options.timestamps ? { createdAt: 'createdAt', updatedAt: 'updatedAt' } : {},
     });
     await repo.ensureTable();
     return repo;

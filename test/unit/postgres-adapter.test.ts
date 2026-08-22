@@ -53,7 +53,7 @@ function fakePool(results: Record<string, unknown>[][] = []): PgPoolLike & {
       /* nothing to close */
     },
   };
-  return pool as PgPoolLike & { statements: string[]; released: number };
+  return pool;
 }
 
 function repoOn(pool: PgPoolLike): PostgresRepo<User> {
@@ -196,9 +196,11 @@ describe('postgres transactions', () => {
     const repo = repoOn(pool);
 
     await repo.withTransaction(async (tx) => {
-      await tx.withTransaction(async () => {
-        throw new Error('inner');
-      }).catch(() => undefined);
+      await tx
+        .withTransaction(async () => {
+          throw new Error('inner');
+        })
+        .catch(() => undefined);
     });
 
     expect(pool.statements).toContain('ROLLBACK TO SAVEPOINT repolayer_sp_1');
@@ -225,5 +227,132 @@ describe('postgres transactions', () => {
     await repoA.withTransaction(async (_tx, ctx) => {
       expect(() => repoB.with(ctx)).not.toThrow();
     });
+  });
+});
+
+describe('postgres cursors', () => {
+  /**
+   * The Postgres cursor path cannot be proven without a server, and the conformance suite
+   * is where that proof lives. What can be checked here is the choreography that makes it
+   * safe: the statement order, and above all that the pooled client is released on every
+   * exit, including the one where the consumer walks away mid-loop.
+   */
+  const page = (n: number): Record<string, unknown>[] =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `id-${i}`,
+      email_address: `u${i}@example.com`,
+      active: true,
+    }));
+
+  async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
+    const rows: T[] = [];
+    for await (const row of iterable) rows.push(row);
+    return rows;
+  }
+
+  it('declares a cursor, fetches in batches, then closes and commits', async () => {
+    // BEGIN, DECLARE, FETCH (2 rows), FETCH (0 rows), CLOSE, COMMIT
+    const pool = fakePool([[], [], page(2), []]);
+    const repo = repoOn(pool);
+
+    const rows = await collect(repo.stream(undefined, { batchSize: 2 }));
+
+    expect(rows).toHaveLength(2);
+    expect(pool.statements[0]).toBe('BEGIN');
+    expect(pool.statements[1]).toContain('NO SCROLL CURSOR FOR SELECT');
+    expect(pool.statements[2]).toMatch(/^FETCH FORWARD 2 FROM repolayer_cur_\d+$/);
+    expect(pool.statements).toContain('COMMIT');
+    expect(pool.statements.some((sql) => sql.startsWith('CLOSE repolayer_cur_'))).toBe(true);
+    expect(pool.released).toBe(1);
+  });
+
+  it('stops fetching once a short batch says the cursor is drained', async () => {
+    // A batch smaller than the requested size can only mean the end, so the extra empty
+    // FETCH that would otherwise be needed to discover that is skipped.
+    const pool = fakePool([[], [], page(1)]);
+    const repo = repoOn(pool);
+
+    await collect(repo.stream(undefined, { batchSize: 10 }));
+
+    expect(pool.statements.filter((sql) => sql.startsWith('FETCH'))).toHaveLength(1);
+  });
+
+  it('releases the client and closes the cursor when the consumer breaks early', async () => {
+    const pool = fakePool([[], [], page(2), page(2), page(2)]);
+    const repo = repoOn(pool);
+
+    for await (const _row of repo.stream(undefined, { batchSize: 2 })) {
+      break;
+    }
+
+    // The leak this guards against is invisible until the pool is exhausted.
+    expect(pool.released).toBe(1);
+    expect(pool.statements.some((sql) => sql.startsWith('CLOSE repolayer_cur_'))).toBe(true);
+    expect(pool.statements).toContain('COMMIT');
+  });
+
+  it('releases the client when the consumer throws inside the loop', async () => {
+    const pool = fakePool([[], [], page(2), page(2)]);
+    const repo = repoOn(pool);
+    const boom = new Error('boom');
+
+    await expect(
+      (async () => {
+        for await (const _row of repo.stream(undefined, { batchSize: 2 })) throw boom;
+      })(),
+    ).rejects.toBe(boom);
+
+    expect(pool.released).toBe(1);
+  });
+
+  it('rolls back and releases when the engine rejects the DECLARE', async () => {
+    const pool = fakePool();
+    const failing: PgPoolLike & { released: number } = {
+      released: 0,
+      query: pool.query.bind(pool),
+      async connect() {
+        return {
+          query: async (sql: string) => {
+            if (sql.startsWith('DECLARE')) throw new Error('syntax error');
+            return { rows: [] };
+          },
+          release: () => {
+            failing.released += 1;
+          },
+        };
+      },
+      end: pool.end.bind(pool),
+    };
+
+    const repo = repoOn(failing);
+    await expect(collect(repo.stream())).rejects.toThrow('syntax error');
+    expect(failing.released).toBe(1);
+  });
+
+  it('runs on the transaction connection instead of opening its own', async () => {
+    // Inside a transaction there is nothing to BEGIN or COMMIT: doing either would end the
+    // caller's transaction out from under them.
+    const pool = fakePool([[], [], [], page(1)]);
+    const repo = repoOn(pool);
+
+    await repo.withTransaction(async (tx) => {
+      await collect(tx.stream(undefined, { batchSize: 5 }));
+    });
+
+    const begins = pool.statements.filter((sql) => sql === 'BEGIN');
+    const commits = pool.statements.filter((sql) => sql === 'COMMIT');
+    expect(begins).toHaveLength(1);
+    expect(commits).toHaveLength(1);
+    expect(pool.statements.some((sql) => sql.startsWith('CLOSE repolayer_cur_'))).toBe(true);
+    expect(pool.released).toBe(1);
+  });
+
+  it('never touches the pool when the iterable is not consumed', async () => {
+    const pool = fakePool();
+    const repo = repoOn(pool);
+    repo.stream();
+    await Promise.resolve();
+    expect(pool.statements).toEqual([]);
+    expect(pool.released).toBe(0);
   });
 });

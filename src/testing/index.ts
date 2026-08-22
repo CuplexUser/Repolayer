@@ -1,7 +1,10 @@
 import { describe, expect, it, afterAll } from 'vitest';
 
 import { defineSchema, type Schema } from '../core/schema.js';
+export { MemoryRepo, MemoryStore, createMemoryRepo } from './memory.js';
+export type { MemoryRepoOptions } from './memory.js';
 import { NotFoundError, QueryError, UniqueConstraintError } from '../core/errors.js';
+import type { Filter, QueryOptions } from '../core/query.js';
 import type { Repo, TxContext } from '../core/repo.js';
 
 /**
@@ -77,12 +80,34 @@ export interface ConformanceAdapter {
    * these tests is broken, while one that declares them is documented.
    */
   unsupported?: Partial<Record<ConformanceCapability, string>>;
+  /**
+   * How many connections are checked out right now, when the engine has a pool.
+   *
+   * When provided, the cursor cases assert it returns to its baseline after a consumer
+   * leaves a stream early. A leaked connection is invisible until the pool is exhausted,
+   * at which point the process deadlocks with no clue as to why.
+   */
+  busyConnections?(): number;
 }
 
 let tableCounter = 0;
+// A per-process random tag, not just the pid: under a thread-based vitest pool every worker
+// shares one pid, and two CI jobs can point at the same server. A collision would surface as
+// an unrelated test failing intermittently, which is the worst kind to chase.
+const tableTag = Math.random().toString(36).slice(2, 8);
 function uniqueTable(prefix: string): string {
   tableCounter += 1;
-  return `${prefix}_${process.pid}_${tableCounter}`;
+  return `${prefix}_${tableTag}_${tableCounter}`;
+}
+
+/**
+ * Drains an async iterable. Written out rather than using `Array.fromAsync`, so the suite
+ * keeps working for consumers whose TypeScript lib target predates ES2024.
+ */
+async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
+  const rows: T[] = [];
+  for await (const row of iterable) rows.push(row);
+  return rows;
 }
 
 const baseWidget = (overrides: Partial<Widget> = {}): Partial<Widget> => ({
@@ -196,6 +221,127 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         const repo = await widgets();
         expect(await repo.createMany([])).toEqual([]);
         expect(await repo.count()).toBe(0);
+      });
+    });
+
+    // ---------------------------------------------------------------- updateMany
+
+    describe('updateMany', () => {
+      async function seeded(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ slug: 'a', quantity: 1, active: true }),
+          baseWidget({ slug: 'b', quantity: 5, active: true }),
+          baseWidget({ slug: 'c', quantity: 9, active: false }),
+        ]);
+        return repo;
+      }
+
+      it('updates every matching row and reports how many matched', async () => {
+        const repo = await seeded();
+        const changed = await repo.updateMany(
+          { where: [{ field: 'active', op: 'eq', value: true }] },
+          { name: 'renamed' },
+        );
+
+        expect(changed).toBe(2);
+        const names = (await repo.findMany({ orderBy: [{ field: 'slug', direction: 'asc' }] })).map(
+          (r) => r.name,
+        );
+        expect(names).toEqual(['renamed', 'renamed', 'Anvil']);
+      });
+
+      it('updates every row when no filter is given, matching deleteMany', async () => {
+        const repo = await seeded();
+        expect(await repo.updateMany(undefined, { active: false })).toBe(3);
+        expect(await repo.count({ where: { active: false } })).toBe(3);
+      });
+
+      it('reports zero and changes nothing when the filter matches nothing', async () => {
+        const repo = await seeded();
+        expect(await repo.updateMany({ where: { slug: 'nope' } }, { name: 'x' })).toBe(0);
+        expect(await repo.count({ where: [{ field: 'name', op: 'eq', value: 'x' }] })).toBe(0);
+      });
+
+      it('counts rows matched, not rows whose value actually changed', async () => {
+        // Otherwise the number would depend on the data rather than on the filter, and the
+        // engines would disagree: MySQL reports changed rows by default where the others
+        // report matched.
+        const repo = await seeded();
+        await repo.updateMany(undefined, { name: 'same' });
+        expect(await repo.updateMany(undefined, { name: 'same' })).toBe(3);
+      });
+
+      it('advances updatedAt but leaves createdAt alone', async () => {
+        const repo = await seeded();
+        const before = await repo.findMany({ orderBy: [{ field: 'slug', direction: 'asc' }] });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+
+        await repo.updateMany(undefined, { name: 'stamped' });
+        const after = await repo.findMany({ orderBy: [{ field: 'slug', direction: 'asc' }] });
+
+        for (const [index, row] of after.entries()) {
+          const original = before[index] as Widget;
+          expect(row.createdAt.getTime()).toBe(original.createdAt.getTime());
+          expect(row.updatedAt.getTime()).toBeGreaterThan(original.updatedAt.getTime());
+        }
+      });
+
+      it('never moves the primary key, even when one is passed', async () => {
+        const repo = await seeded();
+        const ids = (await repo.findMany()).map((r) => r.id).sort();
+        await repo.updateMany(undefined, { id: 'hijacked' });
+        expect((await repo.findMany()).map((r) => r.id).sort()).toEqual(ids);
+      });
+
+      it('works through a filter tree', async () => {
+        const repo = await seeded();
+        const changed = await repo.updateMany(
+          {
+            where: [
+              {
+                or: [
+                  { field: 'slug', op: 'eq', value: 'a' },
+                  { field: 'quantity', op: 'gte', value: 9 },
+                ],
+              },
+            ],
+          },
+          { weight: 9.5 },
+        );
+        expect(changed).toBe(2);
+        expect(await repo.count({ where: [{ field: 'weight', op: 'eq', value: 9.5 }] })).toBe(2);
+      });
+
+      it('rejects an unknown field before touching the database', async () => {
+        const repo = await seeded();
+        await expect(
+          repo.updateMany(undefined, { bogus: 1 } as Partial<Widget>),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('reports the matched count when there is nothing to set', async () => {
+        // Timestamps off, so an empty change really is empty. With them on there is always
+        // an updatedAt to write, which is a different path.
+        const repo = await widgets({ timestamps: false });
+        const stamp = new Date('2024-01-01T00:00:00.000Z');
+        await repo.createMany([
+          baseWidget({ slug: 'x', createdAt: stamp, updatedAt: stamp }),
+          baseWidget({ slug: 'y', createdAt: stamp, updatedAt: stamp }),
+        ]);
+        expect(await repo.updateMany(undefined, {})).toBe(2);
+        expect((await repo.findOne())?.updatedAt.getTime()).toBe(stamp.getTime());
+      });
+
+      it('rolls back with its transaction', async () => {
+        const repo = await seeded();
+        await repo
+          .withTransaction(async (tx) => {
+            await tx.updateMany(undefined, { name: 'ghost' });
+            throw new Error('nope');
+          })
+          .catch(() => undefined);
+        expect(await repo.count({ where: [{ field: 'name', op: 'eq', value: 'ghost' }] })).toBe(0);
       });
     });
 
@@ -405,6 +551,120 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
       });
     });
 
+    // ------------------------------------------------------------- filter trees
+
+    describe('filter trees', () => {
+      async function seeded(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ name: 'Anvil', slug: 'a', quantity: 1, active: true }),
+          baseWidget({ name: 'anvil', slug: 'b', quantity: 5, active: false }),
+          baseWidget({ name: 'Barrel', slug: 'c', quantity: 10, active: true }),
+          baseWidget({ name: 'Crate', slug: 'd', quantity: 10, active: false, meta: { x: 1 } }),
+        ]);
+        return repo;
+      }
+
+      it('matches any branch of an or group', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [
+            {
+              or: [
+                { field: 'slug', op: 'eq', value: 'a' },
+                { field: 'quantity', op: 'gte', value: 10 },
+              ],
+            },
+          ],
+        });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['a', 'c', 'd']);
+      });
+
+      it('ANDs a top level filter with an or group rather than flattening them', async () => {
+        // The case that proves the group is parenthesized. Without the parentheses this
+        // would read as (active AND slug=a) OR quantity>=10 and return three rows.
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [
+            { field: 'active', op: 'eq', value: true },
+            {
+              or: [
+                { field: 'slug', op: 'eq', value: 'a' },
+                { field: 'quantity', op: 'gte', value: 10 },
+              ],
+            },
+          ],
+        });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['a', 'c']);
+      });
+
+      it('nests an and group inside an or group', async () => {
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [
+            {
+              or: [
+                {
+                  and: [
+                    { field: 'active', op: 'eq', value: false },
+                    { field: 'quantity', op: 'lte', value: 5 },
+                  ],
+                },
+                { field: 'slug', op: 'eq', value: 'c' },
+              ],
+            },
+          ],
+        });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['b', 'c']);
+      });
+
+      it('keeps null rows in an or branch that uses ne', async () => {
+        // `ne` preserves nulls on its own; putting it in a group must not change that.
+        const repo = await seeded();
+        const rows = await repo.findMany({
+          where: [
+            {
+              or: [
+                { field: 'meta', op: 'ne', value: { x: 1 } },
+                { field: 'slug', op: 'eq', value: 'zzz' },
+              ],
+            },
+          ],
+        });
+        expect(rows.map((r) => r.slug).sort()).toEqual(['a', 'b', 'c']);
+      });
+
+      it('treats an empty or as matching nothing and an empty and as matching everything', async () => {
+        const repo = await seeded();
+        expect(await repo.findMany({ where: [{ or: [] }] })).toEqual([]);
+        expect((await repo.findMany({ where: [{ and: [] }] })).length).toBe(4);
+      });
+
+      it('counts and deletes through a filter tree, agreeing with findMany', async () => {
+        const repo = await seeded();
+        const tree = {
+          where: [
+            {
+              or: [
+                { field: 'slug' as const, op: 'eq' as const, value: 'a' },
+                { field: 'slug' as const, op: 'eq' as const, value: 'b' },
+              ],
+            },
+          ],
+        };
+        expect(await repo.count(tree)).toBe(2);
+        expect(await repo.deleteMany(tree)).toBe(2);
+        expect(await repo.count()).toBe(2);
+      });
+
+      it('rejects a tree nested past the depth limit', async () => {
+        const repo = await widgets();
+        let node: Filter<Widget> = { field: 'slug', op: 'eq', value: 'a' };
+        for (let i = 0; i < 20; i += 1) node = { and: [node] };
+        await expect(repo.findMany({ where: [node] })).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
     // --------------------------------------------------------- ordering, paging
 
     describe('ordering and paging', () => {
@@ -502,6 +762,363 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
       });
     });
 
+    // ----------------------------------------------------------------- cursors
+
+    describe('streaming cursors', () => {
+      /** 25 rows with a stable sort key and nulls in the nullable column. */
+      async function streamable(): Promise<{ repo: Repo<Widget>; slugs: string[] }> {
+        const repo = await widgets();
+        const rows = Array.from({ length: 25 }, (_, i) =>
+          baseWidget({
+            slug: `s-${String(i).padStart(2, '0')}`,
+            quantity: i,
+            releasedAt: i % 4 === 0 ? null : new Date(1_700_000_000_000 + i * 1000),
+          }),
+        );
+        await repo.createMany(rows);
+        return { repo, slugs: rows.map((r) => r.slug as string) };
+      }
+
+      const order = [{ field: 'slug' as const, direction: 'asc' as const }];
+
+      it('yields exactly findMany, in the same order', async () => {
+        const { repo } = await streamable();
+        const expected = (await repo.findMany({ orderBy: order })).map((r) => r.slug);
+
+        const seen: string[] = [];
+        for await (const row of repo.stream({ orderBy: order })) seen.push(row.slug);
+
+        expect(seen).toEqual(expected);
+      });
+
+      it('returns the same rows whatever the batch size', async () => {
+        const { repo } = await streamable();
+        const expected = (await repo.findMany({ orderBy: order })).map((r) => r.slug);
+
+        for (const batchSize of [1, 7, 25, 1000]) {
+          const seen: string[] = [];
+          for await (const row of repo.stream({ orderBy: order }, { batchSize })) {
+            seen.push(row.slug);
+          }
+          expect(seen, `batchSize ${batchSize}`).toEqual(expected);
+        }
+      });
+
+      it('honors filters, ordering, and limit exactly as findMany does', async () => {
+        const { repo } = await streamable();
+        const query = {
+          where: [{ field: 'quantity' as const, op: 'gte' as const, value: 10 }],
+          orderBy: [{ field: 'quantity' as const, direction: 'desc' as const }],
+          limit: 5,
+        };
+        const expected = (await repo.findMany(query)).map((r) => r.slug);
+
+        const seen: string[] = [];
+        for await (const row of repo.stream(query, { batchSize: 2 })) seen.push(row.slug);
+
+        expect(seen).toEqual(expected);
+      });
+
+      it('round trips every type the way findMany does', async () => {
+        const repo = await widgets();
+        const meta = { tags: ['a'], n: 1 };
+        const released = new Date('2024-03-05T06:07:08.123Z');
+        await repo.create(baseWidget({ meta, releasedAt: released, active: false, weight: -2.5 }));
+
+        const [row] = await collect(repo.stream());
+        expect(row?.meta).toEqual(meta);
+        expect(row?.releasedAt?.getTime()).toBe(released.getTime());
+        expect(row?.active).toBe(false);
+        expect(row?.weight).toBe(-2.5);
+        expect(row?.createdAt).toBeInstanceOf(Date);
+      });
+
+      it('terminates immediately on an empty result', async () => {
+        const repo = await widgets();
+        const seen: Widget[] = [];
+        for await (const row of repo.stream()) seen.push(row);
+        expect(seen).toEqual([]);
+      });
+
+      it('closes cleanly when the consumer breaks out early', async () => {
+        const { repo } = await streamable();
+        const baseline = adapter.busyConnections?.();
+
+        const seen: string[] = [];
+        for await (const row of repo.stream({ orderBy: order }, { batchSize: 2 })) {
+          seen.push(row.slug);
+          if (seen.length === 3) break;
+        }
+        expect(seen).toHaveLength(3);
+
+        // The repo has to still work: on Postgres the cursor held an open transaction, and
+        // on SQLite it held a read lock.
+        expect(await repo.count()).toBe(25);
+        await repo.create(baseWidget({ slug: 'after-break' }));
+
+        if (baseline !== undefined) {
+          expect(adapter.busyConnections?.()).toBe(baseline);
+        }
+      });
+
+      it('closes cleanly when the consumer throws inside the loop', async () => {
+        const { repo } = await streamable();
+        const baseline = adapter.busyConnections?.();
+        const boom = new Error('boom');
+
+        await expect(
+          (async () => {
+            for await (const row of repo.stream({ orderBy: order }, { batchSize: 2 })) {
+              if (row.slug === 's-04') throw boom;
+            }
+          })(),
+        ).rejects.toBe(boom);
+
+        expect(await repo.count()).toBe(25);
+        if (baseline !== undefined) {
+          expect(adapter.busyConnections?.()).toBe(baseline);
+        }
+      });
+
+      it('never opens a cursor when the iterable is not consumed', async () => {
+        const { repo } = await streamable();
+        const baseline = adapter.busyConnections?.();
+        repo.stream({ orderBy: order });
+        if (baseline !== undefined) {
+          expect(adapter.busyConnections?.()).toBe(baseline);
+        }
+        expect(await repo.count()).toBe(25);
+      });
+
+      it('stops on an abort signal and throws the reason it was given', async () => {
+        const { repo } = await streamable();
+        const controller = new AbortController();
+        const reason = new Error('cancelled by the caller');
+
+        const seen: string[] = [];
+        await expect(
+          (async () => {
+            for await (const row of repo.stream(
+              { orderBy: order },
+              { batchSize: 2, signal: controller.signal },
+            )) {
+              seen.push(row.slug);
+              if (seen.length === 2) controller.abort(reason);
+            }
+          })(),
+        ).rejects.toBe(reason);
+
+        // The batch already fetched is still delivered: cancellation takes effect at the
+        // next batch boundary rather than mid-batch.
+        expect(seen.length).toBeGreaterThanOrEqual(2);
+        expect(seen.length).toBeLessThan(25);
+        expect(await repo.count()).toBe(25);
+      });
+
+      it('refuses a batch size that is not a positive integer', async () => {
+        const repo = await widgets();
+        for (const batchSize of [0, -1, 1.5]) {
+          await expect(collect(repo.stream(undefined, { batchSize }))).rejects.toBeInstanceOf(
+            QueryError,
+          );
+        }
+      });
+
+      it('reports a bad query when the iteration starts, not before', async () => {
+        const repo = await widgets();
+        const iterable = repo.stream({
+          where: [{ field: 'nope' as keyof Widget & string, op: 'eq', value: 1 }],
+        });
+        await expect(collect(iterable)).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
+    // ------------------------------------------------------------- keyset paging
+
+    describe('findPage', () => {
+      async function paged(count = 10): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany(
+          Array.from({ length: count }, (_, i) =>
+            baseWidget({
+              slug: `p-${String(i).padStart(2, '0')}`,
+              quantity: i % 3,
+              releasedAt: i % 4 === 0 ? null : new Date(1_700_000_000_000 + i * 1000),
+            }),
+          ),
+        );
+        return repo;
+      }
+
+      /** Walks every page and returns the slugs in the order they were handed back. */
+      async function walk(
+        repo: Repo<Widget>,
+        query: QueryOptions<Widget> | undefined,
+        limit: number,
+        onPage?: () => Promise<void>,
+      ): Promise<string[]> {
+        const seen: string[] = [];
+        let after: string | null = null;
+        for (;;) {
+          const page = await repo.findPage(query, { limit, after });
+          seen.push(...page.items.map((r) => r.slug));
+          if (onPage) await onPage();
+          if (!page.hasMore) break;
+          expect(page.cursor).toBeTypeOf('string');
+          after = page.cursor;
+        }
+        return seen;
+      }
+
+      it('walks the whole set with no gaps and no repeats', async () => {
+        const repo = await paged();
+        const expected = (
+          await repo.findMany({ orderBy: [{ field: 'slug', direction: 'asc' }] })
+        ).map((r) => r.slug);
+
+        const seen = await walk(repo, { orderBy: [{ field: 'slug', direction: 'asc' }] }, 3);
+        expect(seen).toEqual(expected);
+      });
+
+      it('produces the same walk whatever the page size', async () => {
+        const repo = await paged();
+        const query = { orderBy: [{ field: 'slug' as const, direction: 'desc' as const }] };
+        const expected = (await repo.findMany(query)).map((r) => r.slug);
+
+        for (const limit of [1, 2, 7, 100]) {
+          expect(await walk(repo, query, limit), `limit ${limit}`).toEqual(expected);
+        }
+      });
+
+      it('breaks ties with the primary key so a shared sort key cannot skip a row', async () => {
+        // quantity has only three distinct values across ten rows, so every page boundary
+        // lands inside a tie. Without the primary key appended, this loses rows.
+        const repo = await paged();
+        const query = { orderBy: [{ field: 'quantity' as const, direction: 'asc' as const }] };
+        const seen = await walk(repo, query, 3);
+        expect(seen).toHaveLength(10);
+        expect(new Set(seen).size).toBe(10);
+      });
+
+      it('pages a mixed-direction sort correctly', async () => {
+        const repo = await paged();
+        const query = {
+          orderBy: [
+            { field: 'quantity' as const, direction: 'desc' as const },
+            { field: 'slug' as const, direction: 'asc' as const },
+          ],
+        };
+        const expected = (await repo.findMany(query)).map((r) => r.slug);
+        expect(await walk(repo, query, 3)).toEqual(expected);
+      });
+
+      it('pages a nullable sort key, keeping nulls where ORDER BY puts them', async () => {
+        const repo = await paged();
+        for (const direction of ['asc', 'desc'] as const) {
+          const query = { orderBy: [{ field: 'releasedAt' as const, direction }] };
+          // The expected set has to be read under the *total* order, with the primary key
+          // appended, because that is what findPage pages by. Three rows share a null
+          // releasedAt, and comparing against a sort that leaves those three in an
+          // undefined order would be comparing against nothing in particular.
+          const expected = (
+            await repo.findMany({
+              orderBy: [
+                { field: 'releasedAt' as const, direction },
+                { field: 'id' as const, direction: 'asc' as const },
+              ],
+            })
+          ).map((r) => r.slug);
+          expect(await walk(repo, query, 2), direction).toEqual(expected);
+
+          // Nulls still land where ORDER BY puts them: last on asc, first on desc.
+          const walked = await repo.findMany(query);
+          const nullCount = walked.filter((r) => r.releasedAt === null).length;
+          const nullsAt =
+            direction === 'asc' ? walked.slice(-nullCount) : walked.slice(0, nullCount);
+          expect(nullsAt.every((r) => r.releasedAt === null)).toBe(true);
+        }
+      });
+
+      it('applies the caller filter on every page, not just the first', async () => {
+        const repo = await paged();
+        const query = {
+          where: [{ field: 'quantity' as const, op: 'eq' as const, value: 1 }],
+          orderBy: [{ field: 'slug' as const, direction: 'asc' as const }],
+        };
+        const expected = (await repo.findMany(query)).map((r) => r.slug);
+        const seen = await walk(repo, query, 1);
+        expect(seen).toEqual(expected);
+        expect(seen.length).toBeGreaterThan(1);
+      });
+
+      it('neither duplicates nor skips a returned row when rows arrive mid-walk', async () => {
+        // The reason keyset paging exists. An OFFSET walk repeats a row here for every
+        // insert that lands before the current position.
+        const repo = await paged();
+        let inserted = 0;
+        const seen = await walk(
+          repo,
+          { orderBy: [{ field: 'slug', direction: 'asc' }] },
+          3,
+          async () => {
+            inserted += 1;
+            // Sorts before everything already returned, which is what breaks OFFSET.
+            await repo.create(baseWidget({ slug: `a-new-${inserted}` }));
+          },
+        );
+
+        const original = seen.filter((slug) => slug.startsWith('p-'));
+        expect(new Set(seen).size).toBe(seen.length);
+        expect(original).toEqual(original.slice().sort());
+        expect(new Set(original).size).toBe(10);
+      });
+
+      it('reports the last page rather than a cursor that goes nowhere', async () => {
+        const repo = await paged(3);
+        const page = await repo.findPage(undefined, { limit: 10 });
+        expect(page.items).toHaveLength(3);
+        expect(page.hasMore).toBe(false);
+        expect(page.cursor).toBeNull();
+      });
+
+      it('returns an empty first page on an empty table', async () => {
+        const repo = await widgets();
+        const page = await repo.findPage();
+        expect(page).toEqual({ items: [], cursor: null, hasMore: false });
+      });
+
+      it('rejects a cursor minted under a different sort order', async () => {
+        const repo = await paged();
+        const page = await repo.findPage(
+          { orderBy: [{ field: 'slug', direction: 'asc' }] },
+          { limit: 2 },
+        );
+        await expect(
+          repo.findPage(
+            { orderBy: [{ field: 'quantity', direction: 'asc' }] },
+            { limit: 2, after: page.cursor },
+          ),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects a malformed cursor', async () => {
+        const repo = await paged();
+        await expect(
+          repo.findPage(undefined, { after: 'not-a-real-cursor' }),
+        ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects an offset, which keyset paging replaces', async () => {
+        const repo = await paged();
+        await expect(repo.findPage({ offset: 5 })).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects a page limit that is not a positive integer', async () => {
+        const repo = await paged();
+        await expect(repo.findPage(undefined, { limit: 0 })).rejects.toBeInstanceOf(QueryError);
+      });
+    });
+
     // ------------------------------------------------------------------- count
 
     describe('count', () => {
@@ -543,7 +1160,9 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
       it('generates a uuid when none is supplied', async () => {
         const repo = await widgets({ ids: 'uuid' });
         const created = await repo.create(baseWidget());
-        expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(created.id).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
       });
 
       it('honors a caller-supplied id under the provided strategy', async () => {
@@ -579,14 +1198,18 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
       it('rejects an unknown field in where before touching the database', async () => {
         const repo = await widgets();
         await expect(
-          repo.findMany({ where: [{ field: 'nope' as keyof Widget & string, op: 'eq', value: 1 }] }),
+          repo.findMany({
+            where: [{ field: 'nope' as keyof Widget & string, op: 'eq', value: 1 }],
+          }),
         ).rejects.toBeInstanceOf(QueryError);
       });
 
       it('rejects an unknown field in orderBy', async () => {
         const repo = await widgets();
         await expect(
-          repo.findMany({ orderBy: [{ field: 'nope' as keyof Widget & string, direction: 'asc' }] }),
+          repo.findMany({
+            orderBy: [{ field: 'nope' as keyof Widget & string, direction: 'asc' }],
+          }),
         ).rejects.toBeInstanceOf(QueryError);
       });
 
@@ -727,11 +1350,47 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         });
       });
 
+      it('lets a stream inside a transaction see and feed uncommitted writes', async () => {
+        // The cursor runs on the transaction's own connection, so a write made inside the
+        // loop is part of the same transaction and rolls back with it. On Postgres this is
+        // the difference between the cursor joining the transaction and opening its own.
+        const widgetRepo = await widgets();
+        const noteRepo = await adapter.createRepo<Note>({
+          schema: noteSchema,
+          table: uniqueTable('notes'),
+        });
+        await widgetRepo.createMany([
+          baseWidget({ slug: 'w-1' }),
+          baseWidget({ slug: 'w-2' }),
+          baseWidget({ slug: 'w-3' }),
+        ]);
+
+        await expect(
+          widgetRepo.withTransaction(async (tx, ctx: TxContext) => {
+            const notes = noteRepo.with(ctx);
+            for await (const row of tx.stream(
+              { orderBy: [{ field: 'slug', direction: 'asc' }] },
+              { batchSize: 1 },
+            )) {
+              // Writing to a second table rather than the streamed one: mutating a table
+              // while a cursor walks it is unspecified on SQLite, and documented as such.
+              await notes.create({ body: row.slug });
+            }
+            expect(await notes.count()).toBe(3);
+            throw new Error('roll it back');
+          }),
+        ).rejects.toThrow('roll it back');
+
+        expect(await noteRepo.count()).toBe(0);
+      });
+
       it('stays usable after a rolled-back transaction', async () => {
         const repo = await widgets();
-        await repo.withTransaction(async () => {
-          throw new Error('fail');
-        }).catch(() => undefined);
+        await repo
+          .withTransaction(async () => {
+            throw new Error('fail');
+          })
+          .catch(() => undefined);
 
         const created = await repo.create(baseWidget());
         expect(await repo.findById(created.id)).not.toBeNull();

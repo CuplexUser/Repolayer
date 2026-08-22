@@ -1,6 +1,6 @@
 import type { Dialect } from './dialect.js';
 import { SchemaError } from './errors.js';
-import type { FieldDef, FieldType, Schema } from './schema.js';
+import type { FieldDef, FieldMap, FieldType, Schema } from './schema.js';
 import type { IdStrategy } from './repo.js';
 
 /**
@@ -30,6 +30,43 @@ function sqliteType(type: FieldType): string {
   }
 }
 
+/**
+ * Column charset and collation for every string column repolayer creates on MySQL.
+ *
+ * Binary, not the server default. MySQL and MariaDB both default to a case-insensitive
+ * collation, which would make `=`, `in`, `unique`, and `ORDER BY` on text behave
+ * differently than they do on SQLite and Postgres. That is precisely the kind of quiet
+ * divergence this package exists to prevent, so the columns are created case sensitive and
+ * `ilike` asks for insensitivity explicitly when it wants it.
+ */
+const MYSQL_TEXT_COLLATION = 'CHARACTER SET utf8mb4 COLLATE utf8mb4_bin';
+
+/** Length used for a string column that has to be indexable. */
+const MYSQL_KEY_LENGTH = 255;
+
+function mysqlType(type: FieldType, indexed: boolean): string {
+  switch (type) {
+    case 'string':
+      // MySQL cannot index a TEXT column without a prefix length, and cannot give one a
+      // literal DEFAULT at all, so anything indexed or defaulted becomes a VARCHAR.
+      return indexed
+        ? `VARCHAR(${MYSQL_KEY_LENGTH}) ${MYSQL_TEXT_COLLATION}`
+        : `TEXT ${MYSQL_TEXT_COLLATION}`;
+    case 'number':
+      return 'DOUBLE';
+    case 'integer':
+      return 'BIGINT';
+    case 'boolean':
+      return 'TINYINT(1)';
+    case 'date':
+      // Microsecond precision, so a JS millisecond survives the round trip.
+      return 'DATETIME(6)';
+    case 'json':
+      // Native JSON on MySQL; on MariaDB an alias for LONGTEXT with a validity check.
+      return 'JSON';
+  }
+}
+
 function postgresType(type: FieldType): string {
   switch (type) {
     case 'string':
@@ -47,14 +84,40 @@ function postgresType(type: FieldType): string {
   }
 }
 
-function literal(value: unknown, type: FieldType): string {
+/**
+ * Renders a schema default as a SQL literal.
+ *
+ * Dialect aware on purpose: a boolean default has to be written the way the column stores
+ * it, or a row that takes the default would hold a different value than a row the adapter
+ * inserted. SQLite keeps booleans as INTEGER 0/1 (see `toDb`), Postgres as BOOLEAN.
+ */
+function columnType(type: FieldType, dialect: Dialect, indexed: boolean): string {
+  if (dialect === 'sqlite') return sqliteType(type);
+  if (dialect === 'mysql') return mysqlType(type, indexed);
+  return postgresType(type);
+}
+
+function literal(value: unknown, type: FieldType, dialect: Dialect): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'number') return String(value);
   if (typeof value === 'boolean') {
-    return type === 'boolean' ? String(value) : value ? '1' : '0';
+    if (type !== 'boolean') return value ? '1' : '0';
+    return dialect === 'sqlite' ? (value ? '1' : '0') : String(value);
   }
   if (value instanceof Date) return `'${value.toISOString()}'`;
-  const text = type === 'json' ? JSON.stringify(value) : String(value);
+  let text: string;
+  if (type === 'json') {
+    text = JSON.stringify(value);
+  } else if (typeof value === 'string') {
+    text = value;
+  } else {
+    // Stringifying an object here would emit `DEFAULT '[object Object]'`, which is a
+    // silently wrong table rather than an error. Say so instead.
+    throw new SchemaError(
+      `Default value for a ${type} column must be a string, number, boolean, or Date, ` +
+        `not ${typeof value}. Use a json column if the default is structured.`,
+    );
+  }
   // Defaults come from the schema the developer wrote, not from user input, but escaping
   // is still the correct thing to do rather than trusting the source.
   return `'${text.replace(/'/g, "''")}'`;
@@ -78,21 +141,24 @@ function columnClause(
           `strategy, but it is "${def.type}".`,
       );
     }
-    // The one place the DDL genuinely cannot be shared: these are different features
-    // with the same purpose, not different spellings of one feature.
-    parts.push(
-      dialect === 'sqlite'
-        ? 'INTEGER PRIMARY KEY AUTOINCREMENT'
-        : 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY',
-    );
+    // The one place the DDL genuinely cannot be shared: these are three different
+    // features with the same purpose, not three spellings of one feature.
+    if (dialect === 'sqlite') parts.push('INTEGER PRIMARY KEY AUTOINCREMENT');
+    else if (dialect === 'mysql') parts.push('BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY');
+    else parts.push('BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY');
     return parts.join(' ');
   }
 
-  parts.push(dialect === 'sqlite' ? sqliteType(def.type) : postgresType(def.type));
+  // A column carries an index, or a default, only if it is a key, is unique, or declares
+  // one. On MySQL that decides between VARCHAR and TEXT.
+  const indexed = isPk || def.unique === true || def.default !== undefined;
+  parts.push(columnType(def.type, dialect, indexed));
   if (isPk) parts.push('PRIMARY KEY');
   if (!def.nullable && !isPk) parts.push('NOT NULL');
   if (def.unique && !isPk) parts.push('UNIQUE');
-  if (def.default !== undefined) parts.push(`DEFAULT ${literal(def.default, def.type)}`);
+  if (def.default !== undefined) {
+    parts.push(`DEFAULT ${literal(def.default, def.type, dialect)}`);
+  }
 
   return parts.join(' ');
 }
@@ -115,8 +181,9 @@ export function createTableStatements(
     );
   }
 
+  const fields = schema.fields as FieldMap;
   const columns = schema.fieldNames.map((name) =>
-    columnClause(name, schema.fields[name] as FieldDef, schema, dialect, ids),
+    columnClause(name, fields[name] as FieldDef, schema, dialect, ids),
   );
 
   return [`CREATE TABLE IF NOT EXISTS ${table} (\n  ${columns.join(',\n  ')}\n)`];

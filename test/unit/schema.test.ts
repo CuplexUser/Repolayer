@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { defineSchema, type Infer } from '../../src/core/schema.js';
+import { columnFor, defineSchema, type Infer } from '../../src/core/schema.js';
 import { SchemaError, QueryError } from '../../src/core/errors.js';
 import { fromDb, toDb, rowToEntity } from '../../src/core/serialize.js';
+import { openSqlite, SqliteRepo } from '../../src/sqlite/index.js';
 
 describe('defineSchema', () => {
   it('precomputes the field and column lookups both adapters use', () => {
@@ -19,6 +20,7 @@ describe('defineSchema', () => {
   });
 
   it('infers the row type, widening nullable fields to include null', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- used as a type below
     const schema = defineSchema({
       id: { type: 'string', primaryKey: true },
       count: { type: 'integer' },
@@ -46,16 +48,16 @@ describe('defineSchema', () => {
   });
 
   it('rejects a nullable primary key and an empty schema', () => {
-    expect(() =>
-      defineSchema({ a: { type: 'string', primaryKey: true, nullable: true } }),
-    ).toThrow(SchemaError);
+    expect(() => defineSchema({ a: { type: 'string', primaryKey: true, nullable: true } })).toThrow(
+      SchemaError,
+    );
     expect(() => defineSchema({})).toThrow(SchemaError);
   });
 
   it('rejects an unknown field type', () => {
-    expect(() =>
-      defineSchema({ a: { type: 'uuid' as 'string', primaryKey: true } }),
-    ).toThrow(SchemaError);
+    expect(() => defineSchema({ a: { type: 'uuid' as 'string', primaryKey: true } })).toThrow(
+      SchemaError,
+    );
   });
 
   it('rejects two fields mapped to the same column', () => {
@@ -140,5 +142,51 @@ describe('serialization', () => {
     expect(entity.id).toBe('x');
     expect(entity.createdAt).toBeInstanceOf(Date);
     expect(entity.active).toBe(true);
+  });
+});
+
+describe('columnFor', () => {
+  const schema = defineSchema({
+    id: { type: 'string', primaryKey: true },
+    createdAt: { type: 'date', column: 'created_at' },
+  });
+
+  it('resolves a field name to its column', () => {
+    expect(columnFor(schema, 'createdAt', 'test')).toBe('created_at');
+  });
+
+  it('names the context and the known fields when the field is unknown', () => {
+    expect(() => columnFor(schema, 'nope', 'orderBy')).toThrow(SchemaError);
+    expect(() => columnFor(schema, 'nope', 'orderBy')).toThrow(/orderBy.*id, createdAt/s);
+  });
+});
+
+describe('sqlite statement cache', () => {
+  it('stays bounded, so a varied workload cannot grow it forever', async () => {
+    // Every distinct `in` array length compiles to different SQL, so an unbounded cache
+    // keyed by SQL text would grow without limit in a long-running process.
+    const connection = openSqlite({ file: ':memory:' });
+    const repo = new SqliteRepo<{ id: string; name: string }>({
+      table: 'cache_probe',
+      schema: defineSchema({
+        id: { type: 'string', primaryKey: true },
+        name: { type: 'string' },
+      }),
+      connection,
+      ids: 'uuid',
+    });
+    await repo.ensureTable();
+
+    for (let size = 1; size <= 400; size += 1) {
+      await repo.findMany({
+        where: [{ field: 'id', op: 'in', value: Array.from({ length: size }, (_, i) => `x${i}`) }],
+      });
+    }
+
+    expect(connection.cachedStatements).toBeLessThanOrEqual(200);
+    // Still works after the eviction, which is the part that would break if the cache
+    // handed back a statement it had already dropped.
+    expect(await repo.findMany({ where: [{ field: 'id', op: 'in', value: ['a'] }] })).toEqual([]);
+    connection.close();
   });
 });
