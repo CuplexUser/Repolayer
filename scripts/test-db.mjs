@@ -10,6 +10,7 @@
 // Exists as a script rather than a shell one-liner so it behaves the same on Windows,
 // macOS, and Linux without cross-env or shell-specific env syntax.
 import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const ENGINES = {
   postgres: {
@@ -80,7 +81,11 @@ for (const engine of chosen) env[engine.env] ??= engine.url;
 
 const child = spawn(
   process.execPath,
-  [new URL('../node_modules/vitest/vitest.mjs', import.meta.url).pathname, 'run', ...passthrough],
+  [
+    fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
+    'run',
+    ...passthrough,
+  ],
   { stdio: 'inherit', env },
 );
 
