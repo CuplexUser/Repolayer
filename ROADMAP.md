@@ -146,7 +146,7 @@ publishing, not a reason to loosen the suite.
   package exists to avoid. Use an ORM if you want them; that is a legitimate choice, just a
   different one.
 - **A migration engine.** Pair repolayer with `node-pg-migrate` or a SQL-file runner. See
-  the README.
+  [`ensureTable()`](docs/api.md#ensuretable).
 - **Raw SQL passthrough on the `Repo` interface.** Dialect-specific SQL is fine and
   sometimes necessary, but it belongs in one clearly marked place using the driver
   directly, not smuggled through an interface whose entire promise is that every engine
