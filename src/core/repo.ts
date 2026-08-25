@@ -1,4 +1,5 @@
 import type { Dialect } from './dialect.js';
+import type { TableDiff } from './introspect.js';
 import type { QueryOptions } from './query.js';
 import type { Schema } from './schema.js';
 
@@ -108,6 +109,14 @@ export interface Repo<T, ID = string> {
 
   /** Dev and test convenience DDL. Not a migration engine. */
   ensureTable(): Promise<void>;
+  /**
+   * Reads the live table back and reports where it disagrees with the schema.
+   *
+   * The counterpart to `ensureTable()` not being a migration engine: once a real migration
+   * tool owns the table, this is what tells you the table it produced is not the one this
+   * repo thinks it is querying. Read-only, and executes no DDL.
+   */
+  verifyTable(): Promise<TableDiff>;
   /** Releases the underlying connection or pool, when this repo owns it. */
   close(): Promise<void>;
 }

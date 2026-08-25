@@ -1,4 +1,4 @@
-import { SchemaError } from './errors.js';
+import { type RepoError, SchemaError } from './errors.js';
 
 /**
  * The storage types repolayer knows how to normalize across engines. Deliberately small:
@@ -141,11 +141,23 @@ export function defineSchema<const F extends FieldMap>(fields: F): Schema<F> {
   });
 }
 
-/** Resolves a field name to its column, or throws if the field is not in the schema. */
-export function columnFor(schema: Schema, field: string, context: string): string {
+/**
+ * Resolves a field name to its column, or throws if the field is not in the schema.
+ *
+ * `error` decides which class is thrown, because the two callers mean different things by
+ * the same failure: a schema that names an unknown field is a `SchemaError`, while a query
+ * that does is a `QueryError`. Everything else about the check, including the message, is
+ * identical, and it was previously duplicated in the compiler for that one difference.
+ */
+export function columnFor(
+  schema: Schema,
+  field: string,
+  context: string,
+  error: new (message: string) => RepoError = SchemaError,
+): string {
   const column = schema.columns[field];
   if (column === undefined) {
-    throw new SchemaError(
+    throw new error(
       `Unknown field "${field}" in ${context}. Known fields: ${schema.fieldNames.join(', ')}`,
     );
   }

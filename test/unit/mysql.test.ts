@@ -485,3 +485,115 @@ describe('mysql flavor detection', () => {
     ).toThrow(/needs an open pool/);
   });
 });
+
+describe('mysql verifyTable', () => {
+  /** information_schema rows shaped the way MySQL and MariaDB actually return them. */
+  function column(
+    name: string,
+    dataType: string,
+    over: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      COLUMN_NAME: name,
+      DATA_TYPE: dataType,
+      IS_NULLABLE: 'NO',
+      COLUMN_DEFAULT: null,
+      COLLATION_NAME: dataType === 'varchar' || dataType === 'text' ? 'utf8mb4_bin' : null,
+      COLUMN_KEY: name === 'id' ? 'PRI' : name === 'slug' ? 'UNI' : '',
+      EXTRA: '',
+      ...over,
+    };
+  }
+
+  function catalog(over: Record<string, Record<string, unknown>> = {}): unknown[] {
+    const columns = [
+      column('id', 'varchar'),
+      column('name', 'text'),
+      column('slug', 'varchar'),
+      column('quantity', 'bigint'),
+      column('weight', 'double'),
+      column('active', 'tinyint'),
+      column('meta', 'longtext', { IS_NULLABLE: 'YES' }),
+      column('released_at', 'datetime', { IS_NULLABLE: 'YES' }),
+    ].map((c) => ({ ...c, ...(over[String(c['COLUMN_NAME'])] ?? {}) }));
+
+    return [columns, [{ INDEX_NAME: 'slug', COLUMN_NAME: 'slug' }]];
+  }
+
+  it('reads the catalog and reports a clean table', async () => {
+    const pool = fakePool(catalog());
+    const diff = await repoOn(pool).verifyTable();
+
+    expect(diff.findings).toEqual([]);
+    expect(diff.ok).toBe(true);
+    // DATA_TYPE, never COLUMN_TYPE: MariaDB spells the latter `bigint(20)`.
+    expect(pool.statements[0]).toContain('DATA_TYPE');
+    expect(pool.statements[0]).not.toContain('COLUMN_TYPE');
+    expect(pool.statements[1]).toContain('NON_UNIQUE = 0');
+  });
+
+  it('reports the table missing when the catalog returns no columns', async () => {
+    const diff = await repoOn(fakePool([[]])).verifyTable();
+    expect(diff.ok).toBe(false);
+    expect(diff.findings[0]?.kind).toBe('missingTable');
+  });
+
+  it('catches a case insensitive collation, which changes eq, in, and ORDER BY', async () => {
+    const diff = await repoOn(
+      fakePool(catalog({ slug: { COLLATION_NAME: 'utf8mb4_0900_ai_ci' } })),
+    ).verifyTable();
+
+    const finding = diff.findings.find((f) => f.kind === 'collationMismatch');
+    expect(finding?.field).toBe('slug');
+    expect(finding?.actual).toBe('utf8mb4_0900_ai_ci');
+    expect(diff.ok).toBe(false);
+  });
+
+  it('catches a native JSON column, which stops eq from matching the text toDb wrote', async () => {
+    const diff = await repoOn(fakePool(catalog({ meta: { DATA_TYPE: 'json' } }))).verifyTable();
+    expect(diff.findings.find((f) => f.kind === 'typeIncompatible')?.field).toBe('meta');
+  });
+
+  it('catches TIMESTAMP standing in for DATETIME', async () => {
+    const diff = await repoOn(
+      fakePool(catalog({ released_at: { DATA_TYPE: 'timestamp' } })),
+    ).verifyTable();
+    expect(diff.findings.find((f) => f.kind === 'typeIncompatible')?.field).toBe('releasedAt');
+  });
+
+  it('decodes a column name the driver hands back as a Buffer', async () => {
+    const rows = catalog() as [Record<string, unknown>[], unknown];
+    rows[0] = rows[0].map((c) =>
+      c['COLUMN_NAME'] === 'slug'
+        ? {
+            ...c,
+            COLUMN_NAME: new TextEncoder().encode('slug'),
+            DATA_TYPE: new TextEncoder().encode('varchar'),
+          }
+        : c,
+    );
+    expect((await repoOn(fakePool(rows)).verifyTable()).findings).toEqual([]);
+  });
+
+  it('ignores a multi-column unique index, which does not constrain one field', async () => {
+    const rows = catalog();
+    rows[1] = [
+      { INDEX_NAME: 'slug', COLUMN_NAME: 'slug' },
+      { INDEX_NAME: 'pair', COLUMN_NAME: 'name' },
+      { INDEX_NAME: 'pair', COLUMN_NAME: 'quantity' },
+    ];
+    // `pair` covers two columns, so neither `name` nor `quantity` is reported as carrying
+    // a unique the schema does not declare.
+    expect((await repoOn(fakePool(rows)).verifyTable()).findings).toEqual([]);
+  });
+
+  it('treats an AUTO_INCREMENT column as having a default', async () => {
+    const rows = catalog() as [Record<string, unknown>[], unknown];
+    rows[0] = [
+      ...rows[0],
+      column('legacy_seq', 'bigint', { EXTRA: 'auto_increment', COLUMN_KEY: '' }),
+    ];
+    // NOT NULL, no COLUMN_DEFAULT, but the engine supplies one, so inserts still succeed.
+    expect((await repoOn(fakePool(rows)).verifyTable()).findings).toEqual([]);
+  });
+});

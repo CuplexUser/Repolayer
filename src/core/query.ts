@@ -1,6 +1,6 @@
 import type { Dialect } from './dialect.js';
 import { QueryError } from './errors.js';
-import type { FieldType, Schema } from './schema.js';
+import { columnFor, type FieldType, type Schema } from './schema.js';
 import { toDb } from './serialize.js';
 
 export type Operator =
@@ -118,16 +118,6 @@ function isOrGroup<T>(node: Filter<T>): node is OrGroup<T> {
   return Array.isArray((node as OrGroup<T>).or);
 }
 
-function columnOf(schema: Schema, field: string, context: string): string {
-  const column = schema.columns[field];
-  if (column === undefined) {
-    throw new QueryError(
-      `Unknown field "${field}" in ${context}. Known fields: ${schema.fieldNames.join(', ')}`,
-    );
-  }
-  return column;
-}
-
 /**
  * Compiles one filter into SQL. The cross-engine normalizations live here:
  *
@@ -161,7 +151,7 @@ function compileFilter<T>(
     );
   }
 
-  const column = columnOf(schema, field, 'where');
+  const column = columnFor(schema, field, 'where', QueryError);
   const type = schema.types[field] as FieldType;
   const bind = (value: unknown): string => params.add(toDb(value, type, dialect, field));
 
@@ -312,7 +302,7 @@ export function compileOrderBy<T>(
           `Expected "asc" or "desc".`,
       );
     }
-    const column = columnOf(schema, field, 'orderBy');
+    const column = columnFor(schema, field, 'orderBy', QueryError);
     const order = direction.toUpperCase();
 
     if (dialect === 'mysql') {

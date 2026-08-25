@@ -7,6 +7,7 @@ import {
 } from '../core/base.js';
 import type { Dialect, MysqlFlavor } from '../core/dialect.js';
 import { ConnectionError, RepoError, UniqueConstraintError } from '../core/errors.js';
+import { catalogText, type LiveColumn, type TableShape } from '../core/introspect.js';
 import type { IdStrategy, TimestampOptions } from '../core/repo.js';
 
 /**
@@ -303,6 +304,66 @@ export class MysqlRepo<T, ID = string> extends BaseRepo<T, ID> {
     for (let i = 0; i < rows.length; i += batchSize) {
       yield rows.slice(i, i + batchSize);
     }
+  }
+
+  /**
+   * `DATA_TYPE`, never `COLUMN_TYPE`. MariaDB reports `bigint(20)` in the latter where
+   * MySQL 8 reports `bigint`, and the whole premise of this adapter is that one code path
+   * serves both flavors.
+   *
+   * `COLLATION_NAME` is read because it is the highest-value thing this check can catch on
+   * MySQL: `ddl.ts` creates string columns utf8mb4_bin on purpose, and a table built by
+   * anything else almost certainly used the case-insensitive server default.
+   */
+  protected override async readTableShape(): Promise<TableShape> {
+    const executor = this.exec;
+    const rows = await executor.query(
+      `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLLATION_NAME,
+              COLUMN_KEY, EXTRA
+         FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION`,
+      [this.table],
+    );
+    if (rows.length === 0) return { exists: false, columns: [], uniqueColumns: [] };
+
+    const columns: LiveColumn[] = rows.map((row) => {
+      const collation = catalogText(row['COLLATION_NAME']);
+      return {
+        column: catalogText(row['COLUMN_NAME']),
+        dataType: catalogText(row['DATA_TYPE']).toLowerCase(),
+        nullable: catalogText(row['IS_NULLABLE']).toUpperCase() === 'YES',
+        primaryKey: catalogText(row['COLUMN_KEY']).toUpperCase() === 'PRI',
+        // An AUTO_INCREMENT column reports no COLUMN_DEFAULT, but the engine supplies one,
+        // so an insert that omits it still succeeds.
+        hasDefault:
+          (row['COLUMN_DEFAULT'] !== null && row['COLUMN_DEFAULT'] !== undefined) ||
+          /auto_increment/i.test(catalogText(row['EXTRA'])),
+        ...(collation === '' ? {} : { collation: collation.toLowerCase() }),
+      };
+    });
+
+    // Grouped in JS rather than with a HAVING subquery, because what is wanted is the set
+    // of unique indexes covering exactly one column, and that reads far better here.
+    const stats = await executor.query(
+      `SELECT INDEX_NAME, COLUMN_NAME
+         FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0
+          AND INDEX_NAME <> 'PRIMARY'`,
+      [this.table],
+    );
+    const byIndex = new Map<string, string[]>();
+    for (const stat of stats) {
+      const name = catalogText(stat['INDEX_NAME']);
+      const members = byIndex.get(name) ?? [];
+      members.push(catalogText(stat['COLUMN_NAME']));
+      byIndex.set(name, members);
+    }
+    const uniqueColumns = [...byIndex.values()]
+      .filter((members) => members.length === 1)
+      .map((members) => members[0] as string);
+
+    return { exists: true, columns, uniqueColumns };
   }
 
   protected override mapError(error: unknown): unknown {

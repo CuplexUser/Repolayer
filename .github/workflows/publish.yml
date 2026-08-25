@@ -88,6 +88,41 @@ jobs:
       - run: npm run build
         if: steps.published.outputs.already == 'false'
 
+      - name: Decide the dist-tag
+        id: disttag
+        if: steps.published.outputs.already == 'false'
+        # `npm publish` moves `latest` to whatever it just published. It does not compare
+        # versions, so a patch cut from a maintenance branch after a new major is out would
+        # silently drag `latest` backwards and every fresh `npm install` would get the old
+        # major. Deriving the tag from the version being published is what prevents that.
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+
+          # A prerelease never becomes `latest`. This is what makes it safe to push a
+          # v2.0.0-rc.1 tag for real-world feedback without moving anyone's install.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+            echo "::notice::$VERSION is a prerelease, publishing under 'next'."
+            exit 0
+          fi
+
+          # What `latest` points at right now. Empty on the very first publish.
+          CURRENT="$(npm view "$NAME" version 2>/dev/null || true)"
+          MAJOR="${VERSION%%.*}"
+          CURRENT_MAJOR="${CURRENT%%.*}"
+
+          # Only majors are compared. A backport within the current major (2.0.5 while
+          # 2.1.0 is out) would still land on `latest`; that is a narrower case, and the
+          # simple rule is the one worth being able to read at a glance during a release.
+          if [ -n "$CURRENT" ] && [ "$MAJOR" -lt "$CURRENT_MAJOR" ]; then
+            echo "tag=v$MAJOR" >> "$GITHUB_OUTPUT"
+            echo "::notice::$VERSION is behind $CURRENT, publishing under 'v$MAJOR'."
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish with provenance
         if: steps.published.outputs.already == 'false'
         # Authenticated by trusted publishing: npm exchanges the OIDC token minted by the
@@ -102,7 +137,7 @@ jobs:
         #   env:
         #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         # and give that token "Bypass 2FA", since CI cannot answer an OTP prompt.
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --tag "${{ steps.disttag.outputs.tag }}"
 
       - name: Summarize
         if: steps.published.outputs.already == 'false'

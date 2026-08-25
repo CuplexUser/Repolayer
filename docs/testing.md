@@ -89,9 +89,14 @@ runConformanceSuite({
 generates a unique table name per test, tagged with a per-process random suffix, so two CI
 jobs pointed at the same server cannot collide.
 
-`unsupported` takes `'transactions'` or `'autoincrement'`, each mapped to a reason string.
-Declaring one is a deliberate, visible statement rather than a quiet skip: an adapter that
-simply fails those tests is broken, while one that declares them is documented.
+`unsupported` takes `'transactions'`, `'autoincrement'`, or `'introspection'`, each mapped to
+a reason string. Declaring one is a deliberate, visible statement rather than a quiet skip: an
+adapter that simply fails those tests is broken, while one that declares them is documented.
+
+`'introspection'` is for an engine with no catalog to read, where `verifyTable()` cannot find
+drift because there is none to find. `MemoryRepo` declares it. Note that declaring it does not
+excuse an adapter from `verifyTable()` entirely: the case asserting a freshly created table
+reports clean still runs, because every adapter has to answer that question.
 
 `busyConnections` is worth wiring up if the engine has a pool. When it is present, the cursor
 cases assert the count returns to its baseline after a consumer leaves a stream early. A

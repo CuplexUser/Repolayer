@@ -1,6 +1,7 @@
 import { createTableStatements } from './ddl.js';
 import type { Dialect } from './dialect.js';
 import { NotFoundError, QueryError, RepoError, SchemaError } from './errors.js';
+import { diffTable, type TableDiff, type TableShape } from './introspect.js';
 import { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from './keyset.js';
 import {
   compileCount,
@@ -149,6 +150,14 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     params: unknown[],
     batchSize: number,
   ): AsyncIterable<Record<string, unknown>[]>;
+
+  /**
+   * Reads this table out of the engine's own catalog, normalized to a `TableShape`.
+   *
+   * Only the reading is per adapter. Deciding what counts as drift lives in `diffTable`,
+   * so three engines cannot quietly develop three opinions about it.
+   */
+  protected abstract readTableShape(): Promise<TableShape>;
 
   abstract close(): Promise<void>;
 
@@ -681,6 +690,10 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
   }
 
   // ---------------------------------------------------------------- DDL
+
+  async verifyTable(): Promise<TableDiff> {
+    return diffTable(this.schema, this.table, await this.readTableShape(), this.dialect);
+  }
 
   async ensureTable(): Promise<void> {
     for (const statement of createTableStatements(

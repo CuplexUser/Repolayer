@@ -87,12 +87,16 @@ await repo.withTransaction(async (tx) => { /* returning commits, throwing rolls 
 
 for await (const row of repo.stream({ where: { solved: false } })) { /* batched */ }
 await repo.findPage({ orderBy: [{ field: 'createdAt', direction: 'desc' }] }, { limit: 20 });
+
+const diff = await repo.verifyTable();   // does the live table still match this schema?
 ```
 
 ## What this is not
 
 Not an ORM. There is no query builder DSL to learn, no migration engine, no relationship
-mapping, and no lazy-loading magic. It is a deliberately boring contract: a `Repo<T>`
+mapping, no full-text search, and no lazy-loading magic. `verifyTable()` is the one nod
+toward migrations, and it only reads: it tells you the live table has drifted from your
+schema, and leaves fixing it to a real migration tool. It is a deliberately boring contract: a `Repo<T>`
 interface with predictable methods, a small serializable query shape, and four adapters that
 satisfy it identically.
 

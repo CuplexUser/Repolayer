@@ -46,7 +46,9 @@ constraint.
   committed. Code that depends on the distinction needs to know which engine it is on.
 - **Everything outside the query shape.** Full-text search, window functions, arrays, and
   extensions are all deliberately outside this interface. Use the driver directly for those,
-  in one clearly marked place.
+  in one clearly marked place. Full-text search in particular is not coming later:
+  [the roadmap](../ROADMAP.md#never) has the reason, which is that the three engines
+  genuinely disagree about which rows one query matches.
 - **Ties in an `orderBy` are not normalized.** Rows that tie on every sort key come back in
   whatever order the engine read them, which is not the same order on every engine or even on
   every run. `findPage` appends the primary key so that paging cannot skip or repeat a row,

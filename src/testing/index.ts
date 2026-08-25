@@ -42,6 +42,24 @@ export interface Widget {
   updatedAt: Date;
 }
 
+/**
+ * `widgetSchema` plus one field, for the drift case. Pointing this at a table created from
+ * `widgetSchema` produces real drift without the suite needing a raw-SQL escape hatch.
+ */
+export const widerWidgetSchema = defineSchema({
+  id: { type: 'string', primaryKey: true },
+  name: { type: 'string' },
+  slug: { type: 'string', unique: true },
+  quantity: { type: 'integer' },
+  weight: { type: 'number' },
+  active: { type: 'boolean' },
+  meta: { type: 'json', nullable: true },
+  releasedAt: { type: 'date', nullable: true, column: 'released_at' },
+  createdAt: { type: 'date', column: 'created_at' },
+  updatedAt: { type: 'date', column: 'updated_at' },
+  discontinued: { type: 'boolean' },
+});
+
 /** A second model, used to prove two repos can share one transaction. */
 export const noteSchema = defineSchema({
   id: { type: 'string', primaryKey: true },
@@ -54,7 +72,7 @@ export interface Note {
 }
 
 /** Capability groups an adapter may declare unsupported, with a stated reason. */
-export type ConformanceCapability = 'transactions' | 'autoincrement';
+export type ConformanceCapability = 'transactions' | 'autoincrement' | 'introspection';
 
 /** What the suite asks an adapter to build. Exported so adapters can annotate it. */
 export interface ConformanceRepoOptions {
@@ -1228,6 +1246,49 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
           repo.create({ ...baseWidget(), bogus: 1 } as Partial<Widget>),
         ).rejects.toBeInstanceOf(QueryError);
       });
+    });
+
+    // -------------------------------------------------------------- verifyTable
+
+    describe('verifyTable', () => {
+      it('reports no drift against a table it just created', async () => {
+        const repo = await widgets();
+        const diff = await repo.verifyTable();
+
+        // Strict on purpose. This is a table repolayer generated from this exact schema,
+        // so anything at all showing up here is either a real bug in the DDL or a bug in
+        // the catalog read, and both are worth failing on.
+        expect(diff.findings).toEqual([]);
+        expect(diff.ok).toBe(true);
+      });
+
+      const introspectionReason = unsupported.introspection;
+
+      if (introspectionReason) {
+        it(`declares introspection unsupported: ${introspectionReason}`, () => {
+          expect(introspectionReason).toBeTypeOf('string');
+        });
+      } else {
+        it('reports a column the schema expects and the table does not have', async () => {
+          // Drift without any raw DDL: create the table from one schema, then point a repo
+          // carrying a wider schema at the same table. `ensureTable` is CREATE TABLE IF NOT
+          // EXISTS, so the second call leaves the narrower table exactly as it was.
+          const table = uniqueTable('widgets');
+          await adapter.createRepo<Widget>({ schema: widgetSchema, table, timestamps: true });
+
+          const wider = await adapter.createRepo<Widget & { discontinued: boolean }>({
+            schema: widerWidgetSchema,
+            table,
+            timestamps: true,
+          });
+          const diff = await wider.verifyTable();
+
+          expect(diff.ok).toBe(false);
+          const finding = diff.findings.find((f) => f.kind === 'missingColumn');
+          expect(finding?.field).toBe('discontinued');
+          expect(finding?.severity).toBe('error');
+        });
+      }
     });
 
     // ------------------------------------------------------------- transactions

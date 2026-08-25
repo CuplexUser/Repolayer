@@ -13,6 +13,11 @@ that did not exist on npm, so the milestones are named by what they contain inst
 application code, but both break any third-party adapter that implements the interface
 directly, and the whole premise of the conformance suite is that such adapters exist.
 
+Drift detection lands in `2.0.0`, by that same rule and for that same reason. `Repo<T>`
+grew `verifyTable()` and `BaseRepo` grew a `readTableShape()` hook, so an adapter written
+against `1.x` no longer compiles. Application code is untouched: nothing that calls a repo
+needs to change, and the new method is one nobody has to use.
+
 ## Shipped
 
 ### The contract
@@ -91,10 +96,47 @@ normalization layer that already existed:
 - There is no `NULLS FIRST` / `NULLS LAST` syntax, so ordering compiles to an
   `ORDER BY (col IS NULL) ASC|DESC, col` prefix that reproduces the normalized position.
 - `boolean` is `TINYINT(1)`, `date` is `DATETIME(6)` written explicitly in UTC, and `json`
-  is the native `JSON` type, read as raw text on both flavors so one parse path serves
-  both.
+  is `LONGTEXT` rather than the native `JSON` type. A native `JSON` column stores a
+  normalized document, so comparing one against the exact text `toDb` produced does not
+  match even when the document is the same, which would make `eq` and `ne` on a json field
+  answer differently there than on SQLite, Postgres, and `MemoryRepo`. MariaDB's `JSON` is
+  a `LONGTEXT` alias already, so this is what that flavor was doing regardless.
 - Unique violations arrive as error `1062`, in two different message shapes, mapped to
   `UniqueConstraintError` naming the schema field.
+
+### Drift detection
+
+`repo.verifyTable()` reads the live table out of the engine's own catalog and reports where
+it disagrees with the schema descriptor: a missing column, a type that will not round trip,
+a nullability or primary key mismatch, a unique the schema declares and the table does not
+carry.
+
+This is the half of the story `ensureTable()` never told. Once a real migration tool owns
+the table, nothing checked that the table it produced was the table the application queries
+through, and the failure surfaced as a confusing runtime error or as silently wrong
+behavior. Pairing repolayer with a migration tool was advice; now it is checkable.
+
+It executes no DDL, proposes no `ALTER`, and keeps no version table. See
+[Never](#never) below.
+
+Two design points worth stating, because they are what keep it from being noise:
+
+- **Three verdicts, not a boolean.** A table built by somebody else's tool may use a type
+  repolayer never emits. An incompatible type is an error; a type repolayer has no opinion
+  on is a warning that does not clear `ok`. Reporting is the job, not refusing.
+- **Comparison lives in one pure function**, `diffTable` in `src/core/introspect.ts`. Each
+  adapter only reads its own catalog into a normalized `TableShape`, so three engines cannot
+  develop three opinions about what drift is, and the whole matrix is unit-testable with no
+  database.
+
+The highest-value single check is on MySQL. `ensureTable()` creates string columns
+`utf8mb4_bin` on purpose, because the server default is case insensitive and would change
+what `eq`, `in`, `unique`, and `ORDER BY` mean on that engine and no other. A table created
+by anything else almost certainly used the default, and nothing caught it before.
+
+`MemoryRepo` declares the `introspection` capability unsupported, with a reason: it has no
+catalog, its store holds exactly what the schema describes, and a diff would have to be
+invented.
 
 ## Next
 
@@ -145,8 +187,17 @@ publishing, not a reason to loosen the suite.
 - **Relations, eager loading, and a query builder DSL.** These are the ORM features this
   package exists to avoid. Use an ORM if you want them; that is a legitimate choice, just a
   different one.
+- **Full-text search.** Not a matter of taste, but of what the conformance suite can
+  assert. Postgres stems and applies stop words by default, SQLite's FTS5 tokenizer does
+  neither, and MySQL's minimum token length silently drops one- and two-character terms and
+  is a server startup variable an adapter cannot set per connection. Three engines would
+  return three different sets of rows for one query, which is precisely what every other
+  operator is normalized to prevent. `like` and `ilike` are the portable substitute; reach
+  for the driver directly when you need real FTS, in one clearly marked place.
+
 - **A migration engine.** Pair repolayer with `node-pg-migrate` or a SQL-file runner. See
-  [`ensureTable()`](docs/api.md#ensuretable).
+  [`ensureTable()`](docs/api.md#ensuretable). [`verifyTable()`](docs/api.md#verifytable) is
+  deliberately not one either: it reads the catalog and reports, and executes no DDL.
 - **Raw SQL passthrough on the `Repo` interface.** Dialect-specific SQL is fine and
   sometimes necessary, but it belongs in one clearly marked place using the driver
   directly, not smuggled through an interface whose entire promise is that every engine

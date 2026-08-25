@@ -9,6 +9,7 @@ import {
 } from '../core/base.js';
 import type { Dialect } from '../core/dialect.js';
 import { ConnectionError, UniqueConstraintError } from '../core/errors.js';
+import { catalogText, type LiveColumn, type TableShape } from '../core/introspect.js';
 import { RepoError } from '../core/errors.js';
 import type { IdStrategy, TimestampOptions } from '../core/repo.js';
 import type { Schema } from '../core/schema.js';
@@ -242,6 +243,47 @@ export class SqliteRepo<T, ID = string> extends BaseRepo<T, ID> {
       // closing this generator runs the finally.
       iterator.return?.();
     }
+  }
+
+  /**
+   * `pragma_table_info` and friends as table-valued functions rather than bare `PRAGMA`
+   * statements. The function form takes a bound parameter; `PRAGMA table_info(x)` does not,
+   * and would mean interpolating the table name into SQL, which nothing else here does.
+   */
+  protected override async readTableShape(): Promise<TableShape> {
+    const executor = this.exec;
+    const rows = await executor.query(
+      'SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)',
+      [this.table],
+    );
+    if (rows.length === 0) return { exists: false, columns: [], uniqueColumns: [] };
+
+    const columns: LiveColumn[] = rows.map((row) => ({
+      column: catalogText(row['name']),
+      dataType: catalogText(row['type']).toLowerCase(),
+      nullable: Number(row['notnull']) === 0,
+      primaryKey: Number(row['pk']) > 0,
+      hasDefault: row['dflt_value'] !== null && row['dflt_value'] !== undefined,
+    }));
+
+    // origin 'pk' is the primary key index, which `primaryKey` above already reports.
+    const indexes = await executor.query(
+      `SELECT name FROM pragma_index_list(?) WHERE "unique" = 1 AND origin <> 'pk'`,
+      [this.table],
+    );
+    const uniqueColumns: string[] = [];
+    for (const index of indexes) {
+      const members = await executor.query('SELECT name FROM pragma_index_info(?)', [
+        catalogText(index['name']),
+      ]);
+      // Only a single-column index constrains one field the way `unique: true` means.
+      const first = members[0];
+      if (members.length === 1 && first !== undefined) {
+        uniqueColumns.push(catalogText(first['name']));
+      }
+    }
+
+    return { exists: true, columns, uniqueColumns };
   }
 
   protected override mapError(error: unknown): unknown {

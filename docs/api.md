@@ -23,6 +23,7 @@ identically.
   - [`.withTransaction(fn)`](#withtransactionfn)
   - [`.with(ctx)`](#withctx)
   - [`.ensureTable()`](#ensuretable)
+  - [`.verifyTable()`](#verifytable)
   - [`.close()`](#close)
   - [properties](#properties)
 - [Errors](#errors)
@@ -357,7 +358,77 @@ alters an existing table and will not notice drift.
 Once a schema is in production, pair repolayer with a real migration tool such as
 `node-pg-migrate` for Postgres or a small SQL-file runner for SQLite. Keeping migrations out
 is what keeps this package small. If your tables come from a migration tool, note the
-[column requirements on MySQL](engines.md#mysql-and-mariadb-specifics).
+[column requirements on MySQL](engines.md#mysql-and-mariadb-specifics), and use
+[`verifyTable()`](#verifytable) to check that the table you got is the one this schema
+describes.
+
+### `.verifyTable()`
+
+```ts
+verifyTable(): Promise<TableDiff>;
+```
+
+Reads the live table out of the engine's own catalog and reports where it disagrees with the
+schema. Read-only: it runs no DDL, proposes no `ALTER`, and keeps no version table. This is
+the counterpart to `ensureTable()` not being a migration engine, and the answer to "it will
+not notice drift" above.
+
+```ts
+const diff = await repo.verifyTable();
+if (!diff.ok) {
+  for (const finding of diff.findings) console.error(finding.message);
+  throw new Error(`Table "${diff.table}" does not match its schema`);
+}
+```
+
+Worth calling at startup, where a mismatch is a deployment problem you want to hear about
+before the first request rather than during it.
+
+```ts
+interface TableDiff {
+  table: string;
+  /** True when nothing at `error` severity was found. Warnings do not clear it. */
+  ok: boolean;
+  findings: TableFinding[];
+}
+
+interface TableFinding {
+  kind: FindingKind;
+  severity: 'error' | 'warning';
+  field?: string;        // the schema field, where the finding is about one
+  column: string;
+  expected?: string;
+  actual?: string;
+  message: string;       // a full sentence, safe to log as-is
+}
+```
+
+| kind | severity | meaning |
+|---|---|---|
+| `missingTable` | error | the table does not exist |
+| `missingColumn` | error | a field's column is not there; every read names it explicitly |
+| `typeIncompatible` | error | the column will not round trip the declared type |
+| `typeUnknown` | warning | a type repolayer has no opinion on; verify it yourself |
+| `nullabilityMismatch` | error | not checked on the primary key, which is never nullable |
+| `primaryKeyMismatch` | error | `findById`, `update`, `delete`, and paging all key on it |
+| `missingUnique` | error | `unique: true` with no constraint behind it, so duplicates pass |
+| `extraUnique` | warning | a constraint the schema does not declare |
+| `collationMismatch` | error | MySQL only; see below |
+| `extraRequiredColumn` | error | an unknown NOT NULL column with no default, so inserts fail |
+
+Two things it deliberately does not report. Column **defaults**, because every engine
+normalizes a default expression differently and comparing them would produce noise on a
+correct table. And **extra columns** in general, because reads name their columns explicitly
+and an unknown one is invisible; the exception is `extraRequiredColumn`, which breaks every
+insert.
+
+`collationMismatch` is the check most likely to catch something real. `ensureTable()` creates
+string columns `utf8mb4_bin` on purpose, because the MySQL server default is case insensitive
+and would quietly change what `eq`, `in`, `unique`, and `ORDER BY` mean on that engine and no
+other. A table created by any other tool almost certainly used the default.
+
+`MemoryRepo` always reports clean. It has no catalog and no DDL, its store holds exactly what
+the schema describes, so the two cannot drift apart.
 
 ### `.close()`
 

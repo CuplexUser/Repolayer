@@ -47,6 +47,14 @@ export {
   selectList,
 } from './core/query.js';
 export { createTableStatements, dropTableStatement } from './core/ddl.js';
+export { diffTable } from './core/introspect.js';
+export type {
+  FindingKind,
+  LiveColumn,
+  TableDiff,
+  TableFinding,
+  TableShape,
+} from './core/introspect.js';
 export { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from './core/keyset.js';
 export { fromDb, rowToEntity, toDb } from './core/serialize.js';
 

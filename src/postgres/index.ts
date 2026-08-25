@@ -6,6 +6,7 @@ import {
 } from '../core/base.js';
 import type { Dialect } from '../core/dialect.js';
 import { ConnectionError, QueryError, RepoError, UniqueConstraintError } from '../core/errors.js';
+import { catalogText, type LiveColumn, type TableShape } from '../core/introspect.js';
 import type { IdStrategy, TimestampOptions } from '../core/repo.js';
 
 /**
@@ -238,6 +239,64 @@ export class PostgresRepo<T, ID = string> extends BaseRepo<T, ID> {
       }
       release();
     }
+  }
+
+  /**
+   * Two catalog reads: `information_schema.columns` for the columns, and `pg_index` for the
+   * keys.
+   *
+   * `pg_index` rather than `information_schema.table_constraints`, because a unique *index*
+   * created by a migration tool is not a unique *constraint* and would not appear there.
+   * Reporting a missing unique constraint on a table that has a perfectly good unique index
+   * would be a false positive on exactly the tables this is meant to reassure people about.
+   *
+   * The table name is lowered on the way in. repolayer never quotes identifiers, so
+   * Postgres folded the name when the table was created, and a config that spells it
+   * `Widgets` has to match a catalog holding `widgets`.
+   */
+  protected override async readTableShape(): Promise<TableShape> {
+    const executor = this.exec;
+    const rows = await executor.query(
+      `SELECT column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = lower($1)
+        ORDER BY ordinal_position`,
+      [this.table],
+    );
+    if (rows.length === 0) return { exists: false, columns: [], uniqueColumns: [] };
+
+    // indkey[0] rather than ANY(indkey): an index can carry INCLUDE columns alongside its
+    // one key column, and ANY would report those as constrained when they are not.
+    const keys = await executor.query(
+      `SELECT a.attname AS column_name, i.indisprimary
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+        WHERE c.relname = lower($1)
+          AND n.nspname = current_schema()
+          AND i.indisunique
+          AND i.indnkeyatts = 1`,
+      [this.table],
+    );
+
+    const primaryKeys = new Set<string>();
+    const uniqueColumns: string[] = [];
+    for (const key of keys) {
+      const column = catalogText(key['column_name']);
+      if (key['indisprimary'] === true) primaryKeys.add(column);
+      else uniqueColumns.push(column);
+    }
+
+    const columns: LiveColumn[] = rows.map((row) => ({
+      column: catalogText(row['column_name']),
+      dataType: catalogText(row['data_type']).toLowerCase(),
+      nullable: row['is_nullable'] === 'YES',
+      primaryKey: primaryKeys.has(catalogText(row['column_name'])),
+      hasDefault: row['column_default'] !== null && row['column_default'] !== undefined,
+    }));
+
+    return { exists: true, columns, uniqueColumns };
   }
 
   protected override mapError(error: unknown): unknown {

@@ -356,3 +356,80 @@ describe('postgres cursors', () => {
     expect(pool.released).toBe(0);
   });
 });
+
+describe('postgres verifyTable', () => {
+  /** Catalog rows shaped the way information_schema and pg_index actually return them. */
+  function catalog(): Record<string, unknown>[][] {
+    return [
+      [
+        { column_name: 'id', data_type: 'text', is_nullable: 'NO', column_default: null },
+        {
+          column_name: 'email_address',
+          data_type: 'text',
+          is_nullable: 'NO',
+          column_default: null,
+        },
+        { column_name: 'active', data_type: 'boolean', is_nullable: 'NO', column_default: null },
+      ],
+      [
+        { column_name: 'id', indisprimary: true },
+        { column_name: 'email_address', indisprimary: false },
+      ],
+    ];
+  }
+
+  it('reads the catalog and reports a clean table', async () => {
+    const pool = fakePool(catalog());
+    const diff = await repoOn(pool).verifyTable();
+
+    expect(diff.findings).toEqual([]);
+    expect(diff.ok).toBe(true);
+    // Lowered on the way in: repolayer never quotes identifiers, so Postgres folded the
+    // name when the table was created.
+    expect(pool.statements[0]).toContain('table_name = lower($1)');
+    // pg_index rather than information_schema, so a bare unique index still counts.
+    expect(pool.statements[1]).toContain('pg_index');
+    expect(pool.statements[1]).toContain('indnkeyatts = 1');
+  });
+
+  it('reports the table missing when the catalog returns no columns', async () => {
+    const diff = await repoOn(fakePool([[]])).verifyTable();
+    expect(diff.ok).toBe(false);
+    expect(diff.findings[0]?.kind).toBe('missingTable');
+  });
+
+  it('separates the primary key from the unique columns', async () => {
+    const rows = catalog();
+    // Drop the unique index on email_address; the schema declares the field unique.
+    rows[1] = [{ column_name: 'id', indisprimary: true }];
+    const diff = await repoOn(fakePool(rows)).verifyTable();
+
+    expect(diff.findings.find((f) => f.kind === 'missingUnique')?.field).toBe('email');
+    expect(diff.findings.find((f) => f.kind === 'primaryKeyMismatch')).toBeUndefined();
+  });
+
+  it('flags a jsonb field stored as text, which nothing would parse', async () => {
+    const jsonSchema = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      meta: { type: 'json' },
+    });
+    const pool = fakePool([
+      [
+        { column_name: 'id', data_type: 'text', is_nullable: 'NO', column_default: null },
+        { column_name: 'meta', data_type: 'text', is_nullable: 'NO', column_default: null },
+      ],
+      [{ column_name: 'id', indisprimary: true }],
+    ]);
+    const repo = new PostgresRepo({
+      table: 'docs',
+      schema: jsonSchema,
+      connection: pool,
+      ids: 'uuid',
+      timestamps: {},
+    });
+
+    const diff = await repo.verifyTable();
+    expect(diff.ok).toBe(false);
+    expect(diff.findings.find((f) => f.kind === 'typeIncompatible')?.field).toBe('meta');
+  });
+});

@@ -80,3 +80,31 @@ failing until the npm-side configuration is updated to match.
 
 Doing both, pushing a tag and cutting a Release from it, is safe. The second run notices the
 version is already on npm and exits without republishing.
+
+### Dist-tags
+
+The workflow derives the npm dist-tag from the version being published rather than taking
+npm's default, which is to move `latest` to whatever was published last regardless of whether
+it is newer.
+
+| version | published as | because |
+|---|---|---|
+| newer than the current `latest` | `latest` | the ordinary case |
+| an older major than `latest` | `v<major>` | a backport must not drag `latest` down |
+| any prerelease (`2.1.0-rc.1`) | `next` | an rc must not become the default install |
+
+So a patch cut from a `1.x` maintenance branch after `2.0.0` is out publishes under `v1`, and
+`npm install repolayer` keeps resolving to v2. Users on the old line ask for it by name:
+
+```bash
+npm install repolayer          # latest
+npm install repolayer@v1       # the 1.x line
+npm install repolayer@next     # prereleases
+```
+
+This also makes a release candidate safe to publish from `main`: push a `v2.0.0-rc.1` tag,
+get feedback from anyone willing to try it, and nobody's existing install moves.
+
+Only majors are compared, so a backport within the current major (`2.0.5` while `2.1.0` is
+out) would still land on `latest`. A wrong dist-tag is recoverable without republishing:
+`npm dist-tag add repolayer@2.0.0 latest`.

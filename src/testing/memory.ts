@@ -1,4 +1,5 @@
 import { NotFoundError, QueryError, RepoError, UniqueConstraintError } from '../core/errors.js';
+import type { TableDiff } from '../core/introspect.js';
 import { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from '../core/keyset.js';
 import {
   assertNonNegativeInteger,
@@ -666,6 +667,15 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
   async ensureTable(): Promise<void> {
     this.store.rows(this.table);
     return Promise.resolve();
+  }
+
+  /**
+   * Always clean, and honestly so. There is no DDL here and no catalog to read: the store
+   * holds whatever the schema describes, so the schema and the "table" cannot disagree.
+   * Reporting a diff would mean inventing one.
+   */
+  async verifyTable(): Promise<TableDiff> {
+    return Promise.resolve({ table: this.table, ok: true, findings: [] });
   }
 
   /** Nothing to release. Present because the contract has it. */

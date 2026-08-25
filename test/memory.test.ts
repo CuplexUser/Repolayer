@@ -23,4 +23,9 @@ runConformanceSuite({
   async cleanup() {
     store.clear();
   },
+  unsupported: {
+    introspection:
+      'MemoryRepo has no catalog to read. Its store holds exactly what the schema ' +
+      'describes, so the two cannot drift apart and a diff would have to be invented.',
+  },
 });

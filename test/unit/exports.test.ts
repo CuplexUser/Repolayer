@@ -37,6 +37,7 @@ describe('public exports', () => {
       'createTableStatements',
       'decodeCursor',
       'defineSchema',
+      'diffTable',
       'dropTableStatement',
       'encodeCursor',
       'fromDb',
@@ -69,6 +70,7 @@ describe('public exports', () => {
       'createMemoryRepo',
       'noteSchema',
       'runConformanceSuite',
+      'widerWidgetSchema',
       'widgetSchema',
     ]);
   });
