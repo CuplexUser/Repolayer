@@ -215,6 +215,51 @@ count(query?: QueryOptions<T>): Promise<number>;
 How many rows match. `orderBy`, `limit`, and `offset` are ignored, since none of them change
 a count.
 
+### `.aggregate(query)`
+
+```ts
+aggregate<A, G>(query: AggregateQuery<T, A, G>): Promise<AggregateRow<T, G, A>[]>;
+// AggregateQuery: {
+//   where?, groupBy?, aggregates, having?, orderBy?, limit?, offset?
+// }
+// Aggregate:      { fn: 'count' | 'sum' | 'avg' | 'min' | 'max'; field?; distinct? }
+```
+
+Groups rows and reduces each group to the aggregates you name. The one read that does not
+return entities: each record holds the `groupBy` fields at their entity types plus one
+property per alias, and the result types itself from the query.
+
+```ts
+const byDifficulty = await repo.aggregate({
+  groupBy: ['difficulty'],
+  aggregates: { puzzles: { fn: 'count' }, mean: { fn: 'avg', field: 'attempts' } },
+  having: [{ alias: 'puzzles', op: 'gte', value: 2 }],
+  orderBy: [{ field: 'puzzles', direction: 'desc' }],
+});
+```
+
+Omitting `groupBy` reduces the whole filtered set to one record. `where` filters rows before
+they are grouped and `having` filters the groups after, `limit` and `offset` page the groups
+rather than the rows, and an aggregate over no values is null while a `count` is zero. See
+[queries.md](queries.md#aggregation-and-groupby) for the aggregate table, the null rules, and
+what is rejected.
+
+### `.distinct(fields, [query])`
+
+```ts
+distinct<K>(fields: readonly K[], query?: QueryOptions<T>): Promise<Pick<T, K>[]>;
+```
+
+The distinct combinations of the named fields among the rows the filter matches. Naming one
+field gives a list of records to read the value out of:
+
+```ts
+const tags = (await repo.distinct(['status'])).map((row) => row.status);
+```
+
+`orderBy` may only name fields the read selects, because the engines disagree about what
+ordering by any other column would mean.
+
 ### `.stream([query], [options])`
 
 ```ts
@@ -503,7 +548,10 @@ reach for.
 |---|---|
 | `BaseRepo` | the shared adapter base class, holding query compilation and the write paths |
 | `compileSelect`, `compileCount`, `compileWhere`, `compileOrderBy`, `compileLimit` | the SQL compiler, one function per clause |
-| `normalizeWhere`, `selectList`, `ParamList` | the helpers those functions are written in terms of |
+| `compileAggregate`, `compileDistinct`, `aggregateExpression` | the grouping compiler, and the SQL one aggregate renders as |
+| `planAggregate`, `planDistinct` | validation and name resolution with no SQL, which is what a non-SQL adapter needs |
+| `aggregateRow`, `groupValues` | reading a grouped result row back into entity types |
+| `normalizeWhere`, `selectList`, `orderByClause`, `ParamList` | the helpers those functions are written in terms of |
 | `createTableStatements`, `dropTableStatement` | DDL generation |
 | `encodeCursor`, `decodeCursor`, `keysetFilter`, `resolveSortKeys` | the keyset paging primitives |
 | `toDb`, `fromDb`, `rowToEntity` | per-type serialization between JavaScript and each engine |

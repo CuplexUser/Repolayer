@@ -8,15 +8,26 @@ Everything under "Shipped" lands in `1.0.0`, the first stable release. Earlier d
 this file numbered the milestones `v1.0`, `v1.1` and so on, which read as released versions
 that did not exist on npm, so the milestones are named by what they contain instead.
 
-`1.0.0` is a major bump rather than a minor one because `Repo<T>` grew three methods,
-`stream`, `findPage`, and `updateMany`, and `Dialect` grew two members. Neither breaks
-application code, but both break any third-party adapter that implements the interface
-directly, and the whole premise of the conformance suite is that such adapters exist.
+The rule for a major bump is not "`Repo<T>` grew a method". It is that an existing adapter
+can no longer compile without being rewritten, which happens when `BaseRepo` grows an
+abstract member or an existing signature changes. Application code has never been broken by
+a release and that is not what these bumps are about; the conformance suite exists on the
+premise that third-party adapters exist, so their compatibility is what the version number
+tracks.
 
-Drift detection lands in `2.0.0`, by that same rule and for that same reason. `Repo<T>`
-grew `verifyTable()` and `BaseRepo` grew a `readTableShape()` hook, so an adapter written
-against `1.x` no longer compiles. Application code is untouched: nothing that calls a repo
-needs to change, and the new method is one nobody has to use.
+`1.0.0` is a major bump under that rule: `Repo<T>` grew `stream`, `findPage`, and
+`updateMany`, `Dialect` grew two members, and `BaseRepo` grew an abstract `openCursor()`
+that every adapter had to write for itself.
+
+Drift detection lands in `2.0.0` for the same reason. `Repo<T>` grew `verifyTable()` and
+`BaseRepo` grew an abstract `readTableShape()` hook, so every adapter had to supply a
+catalog read before it would compile again.
+
+Aggregation lands in `2.1.0`, and is a minor bump because it adds no abstract member.
+`BaseRepo` implements `aggregate()` and `distinct()` in terms of the executor it already
+has, so every adapter built on it gains both methods and compiles untouched. Only an
+adapter that implements the bare `Repo<T>` interface from scratch has to add them, which is
+what `MemoryRepo` did here.
 
 ## Shipped
 
@@ -79,6 +90,38 @@ have it installed.
 - `MemoryRepo`, exported from `repolayer/memory`, for unit tests with no database at all.
   It passes the conformance suite, which is what separates it from a fake that quietly
   diverges.
+
+### Aggregation
+
+`repo.aggregate()` groups rows and reduces each group to the aggregates the caller names,
+and `repo.distinct()` returns the distinct combinations of a few fields. Both stay inside
+the serializable shape everything else uses: an aggregate is `{ fn, field, distinct }`
+under an alias, `having` filters the groups the way `where` filters the rows, and nothing
+in either is a fragment of SQL.
+
+The interesting part was again what the engines disagree about, and each disagreement is
+settled in the compiler rather than left to the caller:
+
+- **`avg` is computed in double precision everywhere.** Postgres averages an integer column
+  as `numeric` and answers with sixteen decimal places, MySQL answers with a four-place
+  `DECIMAL`, and SQLite with a double. Three numbers for one question. Sums are left exact,
+  since widening one would lose digits nobody asked to lose.
+- **An aggregate over no values is null, and a count is zero.** An ungrouped aggregate over
+  an empty table returns exactly one record, not none, on every engine and in `MemoryRepo`.
+- **`having` repeats the aggregate expression** rather than naming the output alias, because
+  Postgres accepts an alias in `GROUP BY` and `ORDER BY` but not in `HAVING`. It keeps a
+  null group inside `ne`, for the same reason `ne` on a column keeps null rows.
+- **What no engine could answer identically is refused**, with a `QueryError` explaining
+  why: `min`/`max` over a `boolean` (Postgres has no `min(boolean)` at all) or over a
+  `json` value, grouping or counting distinct on `json`, which only Postgres normalizes,
+  and ordering a `distinct` read by a column it does not select, which Postgres rejects and
+  SQLite answers with an arbitrary row per group.
+
+Validation and name resolution live in `planAggregate`, which renders no SQL, so
+`MemoryRepo` shares the rules rather than growing a second opinion about which queries are
+legal. On MySQL, string grouping follows the column's collation: `ensureTable` creates
+string columns `utf8mb4_bin` for exactly this reason, and `verifyTable()` reports a table
+that was created some other way.
 
 ### MySQL and MariaDB, in detail
 

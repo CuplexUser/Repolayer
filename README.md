@@ -80,6 +80,14 @@ await repo.findMany({
   limit: 20,
 });
 
+await repo.aggregate({
+  groupBy: ['difficulty'],
+  aggregates: { puzzles: { fn: 'count' }, newest: { fn: 'max', field: 'createdAt' } },
+  having: [{ alias: 'puzzles', op: 'gte', value: 2 }],
+  orderBy: [{ field: 'puzzles', direction: 'desc' }],
+});
+await repo.distinct(['difficulty'], { where: { solved: false } });
+
 await repo.update(puzzle.id, { solved: true });   // throws NotFoundError if it is gone
 await repo.deleteMany({ where: { solved: true } });
 
@@ -107,7 +115,7 @@ same way, and it is why the abstraction can hold.
 ## Documentation
 
 - [API](docs/api.md) - every export, method by method
-- [Queries](docs/queries.md) - filters, filter trees, operators, ordering, limits
+- [Queries](docs/queries.md) - filters, filter trees, operators, ordering, limits, grouping
 - [Streaming and paging](docs/streaming.md) - cursors, cancellation, keyset pagination
 - [Engines](docs/engines.md) - what is normalized, what differs, MySQL and MariaDB specifics
 - [Testing](docs/testing.md) - `MemoryRepo`, and the conformance suite for adapter authors

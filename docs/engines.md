@@ -30,6 +30,10 @@ constraint.
   produces the same order.
 - **Storage types.** Booleans, dates, and JSON are stored differently on each engine and
   round trip through real `boolean`, `Date`, and parsed JSON values on all of them.
+- **Aggregate results.** `avg` is computed in double precision everywhere, since Postgres
+  would otherwise answer an integer average as a sixteen-place `numeric` and MySQL as a
+  four-place `DECIMAL`. A count arrives as a `number` whatever the driver makes of a BIGINT,
+  a sum keeps its field's declared type, and a `min` or `max` over a date is a `Date`.
 - **Constraint errors.** `SQLITE_CONSTRAINT_UNIQUE`, SQLSTATE `23505`, and MySQL error `1062`
   all become `UniqueConstraintError`, naming the same schema field.
 - **`RETURNING`.** SQLite and Postgres have it, MySQL does not. On MySQL a `create` or
@@ -69,6 +73,10 @@ things that genuinely differ between them, so `driver: 'mysql'` is correct for e
   under which `=`, `in`, `unique`, and `ORDER BY` on text would all behave differently than on
   SQLite and Postgres. If your tables come from a migration tool, create string columns the
   same way: forcing a collation onto a latin1 column is an error rather than a comparison.
+  It is also what makes `groupBy`, `distinct`, and `min`/`max` on a string field mean here
+  what they mean elsewhere: under the default collation MySQL folds `Anvil` and `anvil` into
+  one group, and no other engine does. `verifyTable()` reports a table whose string columns
+  were created some other way.
 - **Reserved words.** Identifiers are never quoted, on any engine, so a column named `order`
   or `rank` will not work. Quoting them would change how Postgres folds case on existing
   tables, which is a worse trade than the limitation.

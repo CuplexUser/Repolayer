@@ -279,15 +279,45 @@ export function compileWhere<T>(
   return ` WHERE ${clauses.join(' AND ')}`;
 }
 
+/** One thing to sort by, already rendered: a column, or an aggregate expression. */
+export interface OrderTerm {
+  expr: string;
+  direction: 'asc' | 'desc';
+}
+
 /**
- * Builds `ORDER BY`, always with an explicit null position.
+ * Builds `ORDER BY` over already-rendered expressions, always with an explicit null
+ * position.
  *
  * Left to their defaults the engines disagree: Postgres sorts NULLs last on ASC, SQLite
  * sorts them first, MySQL sorts them first. Stating the position explicitly is what keeps
  * a paged result set identical after a driver swap. SQLite has supported the NULLS
  * FIRST/LAST syntax since 3.30; MySQL has no such syntax at all, so the same position is
  * produced by sorting on the nullness first.
+ *
+ * It takes expressions rather than fields because a grouped query sorts by things that are
+ * not columns, and the null position has to be normalized there too.
  */
+export function orderByClause(terms: OrderTerm[], dialect: Dialect): string {
+  if (terms.length === 0) return '';
+
+  const parts = terms.map(({ expr, direction }) => {
+    const order = direction.toUpperCase();
+
+    if (dialect === 'mysql') {
+      // `(x IS NULL)` is 0 for a value and 1 for a null, so sorting it ASC puts nulls
+      // last and DESC puts them first, which is exactly what NULLS LAST/FIRST mean.
+      return `(${expr} IS NULL) ${order}, ${expr} ${order}`;
+    }
+
+    const nulls = direction === 'asc' ? 'NULLS LAST' : 'NULLS FIRST';
+    return `${expr} ${order} ${nulls}`;
+  });
+
+  return ` ORDER BY ${parts.join(', ')}`;
+}
+
+/** Builds `ORDER BY` for a query that sorts by schema fields. */
 export function compileOrderBy<T>(
   orderBy: OrderBy<T>[] | undefined,
   schema: Schema,
@@ -295,27 +325,17 @@ export function compileOrderBy<T>(
 ): string {
   if (orderBy === undefined || orderBy.length === 0) return '';
 
-  const parts = orderBy.map(({ field, direction }) => {
+  const terms = orderBy.map(({ field, direction }) => {
     if (direction !== 'asc' && direction !== 'desc') {
       throw new QueryError(
         `Invalid sort direction ${JSON.stringify(direction)} on field "${String(field)}". ` +
           `Expected "asc" or "desc".`,
       );
     }
-    const column = columnFor(schema, field, 'orderBy', QueryError);
-    const order = direction.toUpperCase();
-
-    if (dialect === 'mysql') {
-      // `(col IS NULL)` is 0 for a value and 1 for a null, so sorting it ASC puts nulls
-      // last and DESC puts them first, which is exactly what NULLS LAST/FIRST mean.
-      return `(${column} IS NULL) ${order}, ${column} ${order}`;
-    }
-
-    const nulls = direction === 'asc' ? 'NULLS LAST' : 'NULLS FIRST';
-    return `${column} ${order} ${nulls}`;
+    return { expr: columnFor(schema, field, 'orderBy', QueryError), direction };
   });
 
-  return ` ORDER BY ${parts.join(', ')}`;
+  return orderByClause(terms, dialect);
 }
 
 /**

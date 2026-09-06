@@ -1,3 +1,4 @@
+import type { AggregateMap, AggregateQuery, AggregateRow } from './aggregate.js';
 import type { Dialect } from './dialect.js';
 import type { TableDiff } from './introspect.js';
 import type { QueryOptions } from './query.js';
@@ -64,6 +65,33 @@ export interface Repo<T, ID = string> {
   findOne(query?: QueryOptions<T>): Promise<T | null>;
   findMany(query?: QueryOptions<T>): Promise<T[]>;
   count(query?: QueryOptions<T>): Promise<number>;
+
+  /**
+   * Groups rows and reduces each group to the aggregates you name.
+   *
+   * The one read that does not return entities: it answers a question about a set of rows
+   * rather than handing the rows back, so each result record holds the `groupBy` fields at
+   * their entity types plus one property per alias. Omitting `groupBy` reduces the whole
+   * filtered set to a single record.
+   *
+   * `where` filters rows before they are grouped and `having` filters the groups after,
+   * which is the distinction SQL draws and the reason both exist.
+   */
+  aggregate<A extends AggregateMap<T>, G extends keyof T & string = never>(
+    query: AggregateQuery<T, A, G>,
+  ): Promise<AggregateRow<T, G, A>[]>;
+
+  /**
+   * The distinct combinations of the named fields among the rows the filter matches.
+   *
+   * Deduplication is on the selected fields only, so the result is a list of partial
+   * entities rather than rows: for a single field, `rows.map((row) => row.status)` is the
+   * list of values. `orderBy` may only name fields the read selects.
+   */
+  distinct<K extends keyof T & string>(
+    fields: readonly K[],
+    query?: QueryOptions<T>,
+  ): Promise<Pick<T, K>[]>;
 
   /**
    * Pulls rows in batches instead of materializing the whole result set, so a table larger

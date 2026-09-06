@@ -1,3 +1,12 @@
+import {
+  aggregateRow,
+  compileAggregate,
+  compileDistinct,
+  groupValues,
+  type AggregateMap,
+  type AggregateQuery,
+  type AggregateRow,
+} from './aggregate.js';
 import { createTableStatements } from './ddl.js';
 import type { Dialect } from './dialect.js';
 import { NotFoundError, QueryError, RepoError, SchemaError } from './errors.js';
@@ -263,6 +272,29 @@ export abstract class BaseRepo<T, ID = string> implements Repo<T, ID> {
     const raw = rows[0]?.['count'];
     // Postgres returns COUNT(*) as a BIGINT, which pg surfaces as a string.
     return typeof raw === 'number' ? raw : Number(raw ?? 0);
+  }
+
+  async aggregate<A extends AggregateMap<T>, G extends keyof T & string = never>(
+    query: AggregateQuery<T, A, G>,
+  ): Promise<AggregateRow<T, G, A>[]> {
+    const { sql, params, plan } = compileAggregate(this.schema, this.table, query, this.dialect);
+    const rows = await this.run(sql, params);
+    return rows.map((row) => aggregateRow(row, plan, this.dialect)) as AggregateRow<T, G, A>[];
+  }
+
+  async distinct<K extends keyof T & string>(
+    fields: readonly K[],
+    query?: QueryOptions<T>,
+  ): Promise<Pick<T, K>[]> {
+    const { sql, params, groups } = compileDistinct(
+      this.schema,
+      this.table,
+      fields,
+      query,
+      this.dialect,
+    );
+    const rows = await this.run(sql, params);
+    return rows.map((row) => groupValues(row, groups, this.dialect)) as Pick<T, K>[];
   }
 
   // ---------------------------------------------------------------- cursors

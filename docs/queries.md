@@ -21,6 +21,8 @@ shape is what lets four very different engines behave the same way.
 - [Operators](#operators)
 - [`orderBy`](#orderby)
 - [`limit` and `offset`](#limit-and-offset)
+- [Aggregation and `groupBy`](#aggregation-and-groupby)
+- [Distinct values](#distinct-values)
 - [What is rejected](#what-is-rejected)
 
 ## `where`
@@ -125,6 +127,87 @@ deeper it goes, and rows written during the walk shift pages underneath it, whic
 [`findPage`](streaming.md#paging) exists to fix. `count` ignores both, and `findPage` rejects
 `offset` outright.
 
+## Aggregation and `groupBy`
+
+`repo.aggregate()` is the one read that does not return entities. It answers a question about
+a set of rows rather than handing the rows back, so each record holds the `groupBy` fields at
+their entity types plus one property per aggregate alias.
+
+```ts
+const byDifficulty = await repo.aggregate({
+  where: [{ field: 'solved', op: 'eq', value: true }],   // filters rows
+  groupBy: ['difficulty'],
+  aggregates: {
+    puzzles: { fn: 'count' },
+    firstSolved: { fn: 'min', field: 'createdAt' },
+  },
+  having: [{ alias: 'puzzles', op: 'gte', value: 2 }],   // filters groups
+  orderBy: [{ field: 'puzzles', direction: 'desc' }],
+  limit: 10,
+});
+// [{ difficulty: 3, puzzles: 7, firstSolved: Date }, ...]
+```
+
+Omitting `groupBy` reduces the whole filtered set to a single record, which is what a totals
+row is:
+
+```ts
+const [totals] = await repo.aggregate({
+  aggregates: {
+    puzzles: { fn: 'count' },
+    hardest: { fn: 'max', field: 'difficulty' },
+    mean: { fn: 'avg', field: 'difficulty' },
+  },
+});
+```
+
+| aggregate | needs a field | reads back as | notes |
+|---|---|---|---|
+| `count` | no | `number`, never null | with no field it counts rows, with one it counts non-null values |
+| `sum` | number or integer | the field's type, or null | null over no values, not zero |
+| `avg` | number or integer | `number`, or null | always computed in double precision |
+| `min` `max` | string, number, integer, or date | the field's type, or null | a min over a date is a `Date` |
+
+`distinct: true` on a `count`, `sum`, or `avg` reduces each value once
+(`{ fn: 'count', field: 'title', distinct: true }`).
+
+Three things are worth stating outright, because they are where engines usually disagree:
+
+- **An aggregate over no values is null, not zero.** A `count` is the exception: it is a
+  number even when there is nothing to count. An ungrouped aggregate over an empty table still
+  returns exactly one record, with a zero count and null everywhere else, and a grouped one
+  returns no records at all.
+- **`avg` is computed in double precision on every engine.** Left alone, Postgres would answer
+  with sixteen decimal places, MySQL with four, and SQLite with a double, so the same rows
+  would produce three different numbers.
+- **`where` filters rows before grouping, `having` filters groups after.** `having` names an
+  aggregate alias, never a column, and it takes the comparison operators plus `isNull`. Like
+  `ne` on a column, `having` with `ne` keeps a group whose aggregate is null.
+
+An alias becomes an unquoted SQL identifier, so it has to be a plain identifier, and two names
+in one result cannot differ only in case, because Postgres folds unquoted identifiers to lower
+case. Avoid engine keywords such as `rows` or `groups` for the same reason column names avoid
+them.
+
+## Distinct values
+
+```ts
+const statuses = await repo.distinct(['status'], {
+  where: [{ field: 'archived', op: 'eq', value: false }],
+  orderBy: [{ field: 'status', direction: 'asc' }],
+});
+// [{ status: 'draft' }, { status: 'published' }]
+// statuses.map((row) => row.status) for the bare list
+```
+
+Deduplication is on the selected fields only, so naming several fields returns each distinct
+combination rather than each field's values independently. A null is one distinct value, and
+sorts by the same rule as everywhere else.
+
+`orderBy` may only name fields the read selects. Postgres refuses to order a distinct read by
+a column it does not select, and SQLite accepts it and picks an arbitrary row per group, so
+the query is refused everywhere rather than meaning two things.
+
 ## What is rejected
 
 A query that cannot be compiled throws `QueryError`, always before any SQL reaches the
@@ -136,6 +219,14 @@ database:
 - a value that cannot be serialized to the field's declared type
 - a `limit` or `offset` that is negative or not an integer
 - a filter tree deeper than 16 levels
+- an aggregate no engine could answer identically: summing or averaging anything but a number
+  or an integer, a `min` or `max` over a `boolean` (Postgres has none) or a `json` value, and
+  grouping, counting distinct, or `distinct` on a `json` field
+- an aggregate alias that is not a plain identifier, or two names in one grouped result that
+  differ only in case
+- a `having` that names a column rather than an aggregate alias, and an aggregate `orderBy`
+  that names neither a group field nor an alias
+- a `distinct` read ordered by a field it does not select
 
 Values never reach the SQL text. Every one becomes a bound parameter, including the pattern
 of a `like`, and `MemoryRepo` escapes those patterns before turning them into a regular

@@ -31,9 +31,20 @@ export type {
   Filter,
   Operator,
   OrderBy,
+  OrderTerm,
   OrGroup,
   QueryOptions,
 } from './core/query.js';
+export type {
+  Aggregate,
+  AggregateFn,
+  AggregateMap,
+  AggregateOrderBy,
+  AggregateQuery,
+  AggregateRow,
+  HavingFilter,
+  HavingOperator,
+} from './core/aggregate.js';
 export type { Dialect, MysqlFlavor } from './core/dialect.js';
 
 export {
@@ -43,9 +54,28 @@ export {
   compileSelect,
   compileWhere,
   normalizeWhere,
+  orderByClause,
   ParamList,
   selectList,
 } from './core/query.js';
+export {
+  aggregateExpression,
+  aggregateRow,
+  compileAggregate,
+  compileDistinct,
+  groupValues,
+  planAggregate,
+  planDistinct,
+} from './core/aggregate.js';
+export type {
+  AggregateOrderTerm,
+  AggregatePlan,
+  AggregateTerm,
+  CompiledAggregate,
+  CompiledDistinct,
+  GroupTerm,
+  HavingTerm,
+} from './core/aggregate.js';
 export { createTableStatements, dropTableStatement } from './core/ddl.js';
 export { diffTable } from './core/introspect.js';
 export type {

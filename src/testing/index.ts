@@ -1159,6 +1159,342 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
       });
     });
 
+    // -------------------------------------------------------------- aggregation
+
+    describe('aggregate', () => {
+      const released = new Date('2024-03-05T06:07:08.000Z');
+      const laterReleased = new Date('2024-07-09T10:11:12.000Z');
+
+      async function seeded(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ name: 'Anvil', slug: 'a', quantity: 2, weight: 1.5, releasedAt: released }),
+          baseWidget({ name: 'Anvil', slug: 'b', quantity: 4, weight: 2.5, active: false }),
+          baseWidget({
+            name: 'Barrel',
+            slug: 'c',
+            quantity: 6,
+            weight: 3,
+            releasedAt: laterReleased,
+          }),
+          baseWidget({ name: 'Crate', slug: 'd', quantity: 6, weight: 4 }),
+        ]);
+        return repo;
+      }
+
+      it('reduces the whole table to one record when there is no groupBy', async () => {
+        const repo = await seeded();
+        const [totals] = await repo.aggregate({
+          aggregates: {
+            tally: { fn: 'count' },
+            totalQuantity: { fn: 'sum', field: 'quantity' },
+            averageWeight: { fn: 'avg', field: 'weight' },
+            smallest: { fn: 'min', field: 'quantity' },
+            largest: { fn: 'max', field: 'quantity' },
+          },
+        });
+
+        expect(totals).toEqual({
+          tally: 4,
+          totalQuantity: 18,
+          averageWeight: 2.75,
+          smallest: 2,
+          largest: 6,
+        });
+      });
+
+      it('answers an ungrouped aggregate over an empty table with one record', async () => {
+        const repo = await widgets();
+        const rows = await repo.aggregate({
+          aggregates: { tally: { fn: 'count' }, total: { fn: 'sum', field: 'quantity' } },
+        });
+
+        // Not zero rows, and not a zero sum: every engine reports one row here, with a
+        // count of nothing and a sum that is genuinely unknown.
+        expect(rows).toEqual([{ tally: 0, total: null }]);
+      });
+
+      it('filters rows with where before they are grouped', async () => {
+        const repo = await seeded();
+        const [totals] = await repo.aggregate({
+          where: [{ field: 'quantity', op: 'gte', value: 4 }],
+          aggregates: { tally: { fn: 'count' }, total: { fn: 'sum', field: 'quantity' } },
+        });
+
+        expect(totals).toEqual({ tally: 3, total: 16 });
+      });
+
+      it('groups by a field and reduces each group', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['name'],
+          aggregates: {
+            tally: { fn: 'count' },
+            total: { fn: 'sum', field: 'quantity' },
+          },
+          orderBy: [{ field: 'name', direction: 'asc' }],
+        });
+
+        expect(rows).toEqual([
+          { name: 'Anvil', tally: 2, total: 6 },
+          { name: 'Barrel', tally: 1, total: 6 },
+          { name: 'Crate', tally: 1, total: 6 },
+        ]);
+      });
+
+      it('groups by several fields at once', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['name', 'active'],
+          aggregates: { tally: { fn: 'count' } },
+          orderBy: [
+            { field: 'name', direction: 'asc' },
+            { field: 'active', direction: 'asc' },
+          ],
+        });
+
+        expect(rows).toEqual([
+          { name: 'Anvil', active: false, tally: 1 },
+          { name: 'Anvil', active: true, tally: 1 },
+          { name: 'Barrel', active: true, tally: 1 },
+          { name: 'Crate', active: true, tally: 1 },
+        ]);
+      });
+
+      it('gathers null keys into one group, placed by the same null rules as orderBy', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['releasedAt'],
+          aggregates: { tally: { fn: 'count' } },
+          orderBy: [{ field: 'releasedAt', direction: 'asc' }],
+        });
+
+        expect(rows).toEqual([
+          { releasedAt: released, tally: 1 },
+          { releasedAt: laterReleased, tally: 1 },
+          // Nulls last on asc, exactly as they sort in findMany.
+          { releasedAt: null, tally: 2 },
+        ]);
+      });
+
+      it('orders by an aggregate as well as by a group field', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['name'],
+          aggregates: { tally: { fn: 'count' } },
+          orderBy: [
+            { field: 'tally', direction: 'desc' },
+            { field: 'name', direction: 'asc' },
+          ],
+        });
+
+        expect(rows.map((row) => row.name)).toEqual(['Anvil', 'Barrel', 'Crate']);
+      });
+
+      it('skips nulls in count, sum, min, and max rather than counting them as zero', async () => {
+        const repo = await seeded();
+        const [totals] = await repo.aggregate({
+          aggregates: {
+            tally: { fn: 'count' },
+            released: { fn: 'count', field: 'releasedAt' },
+            earliest: { fn: 'min', field: 'releasedAt' },
+            latest: { fn: 'max', field: 'releasedAt' },
+          },
+        });
+
+        expect(totals).toEqual({
+          tally: 4,
+          released: 2,
+          earliest: released,
+          latest: laterReleased,
+        });
+      });
+
+      it('counts distinct values of a field', async () => {
+        const repo = await seeded();
+        const [totals] = await repo.aggregate({
+          aggregates: {
+            names: { fn: 'count', field: 'name', distinct: true },
+            quantities: { fn: 'count', field: 'quantity', distinct: true },
+            sumOfDistinct: { fn: 'sum', field: 'quantity', distinct: true },
+          },
+        });
+
+        expect(totals).toEqual({ names: 3, quantities: 3, sumOfDistinct: 12 });
+      });
+
+      it('averages in double precision, so every engine returns the same number', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ quantity: 1 }),
+          baseWidget({ quantity: 2 }),
+          baseWidget({ quantity: 2 }),
+        ]);
+
+        const [totals] = await repo.aggregate({
+          aggregates: { mean: { fn: 'avg', field: 'quantity' } },
+        });
+
+        // A repeating decimal is the case that separates the engines: Postgres would
+        // answer as numeric with sixteen places and MySQL as a DECIMAL with four, so
+        // anything less than full double precision here means the cast was dropped.
+        expect(totals?.mean).toBeCloseTo(5 / 3, 12);
+      });
+
+      it('filters groups with having, after they are formed', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['name'],
+          aggregates: { tally: { fn: 'count' } },
+          having: [{ alias: 'tally', op: 'gte', value: 2 }],
+          orderBy: [{ field: 'name', direction: 'asc' }],
+        });
+
+        expect(rows).toEqual([{ name: 'Anvil', tally: 2 }]);
+      });
+
+      it('keeps groups whose aggregate is null out of a comparison but inside ne', async () => {
+        const repo = await seeded();
+        const query = {
+          groupBy: ['name'] as const,
+          aggregates: { earliest: { fn: 'min', field: 'releasedAt' } } as const,
+          orderBy: [{ field: 'name', direction: 'asc' as const }],
+        };
+
+        const compared = await repo.aggregate({
+          ...query,
+          having: [{ alias: 'earliest', op: 'gte', value: released }],
+        });
+        expect(compared.map((row) => row.name)).toEqual(['Anvil', 'Barrel']);
+
+        // Crate released nothing, so its minimum is unknown rather than equal to anything,
+        // and `ne` keeps it for the same reason it keeps null rows on a column.
+        const differing = await repo.aggregate({
+          ...query,
+          having: [{ alias: 'earliest', op: 'ne', value: released }],
+        });
+        expect(differing.map((row) => row.name)).toEqual(['Barrel', 'Crate']);
+      });
+
+      it('pages the groups, not the rows, with limit and offset', async () => {
+        const repo = await seeded();
+        const query = {
+          groupBy: ['name'] as const,
+          aggregates: { tally: { fn: 'count' } } as const,
+          orderBy: [{ field: 'name', direction: 'asc' as const }],
+        };
+
+        expect((await repo.aggregate({ ...query, limit: 2 })).map((row) => row.name)).toEqual([
+          'Anvil',
+          'Barrel',
+        ]);
+        expect(
+          (await repo.aggregate({ ...query, limit: 2, offset: 2 })).map((row) => row.name),
+        ).toEqual(['Crate']);
+      });
+
+      it('returns no records at all when a grouped query matches no rows', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          where: [{ field: 'name', op: 'eq', value: 'nothing' }],
+          groupBy: ['name'],
+          aggregates: { tally: { fn: 'count' } },
+        });
+
+        expect(rows).toEqual([]);
+      });
+
+      it('groups with no aggregates at all', async () => {
+        const repo = await seeded();
+        const rows = await repo.aggregate({
+          groupBy: ['name'],
+          aggregates: {},
+          orderBy: [{ field: 'name', direction: 'asc' }],
+        });
+
+        expect(rows).toEqual([{ name: 'Anvil' }, { name: 'Barrel' }, { name: 'Crate' }]);
+      });
+    });
+
+    // ---------------------------------------------------------------- distinct
+
+    describe('distinct', () => {
+      async function seeded(): Promise<Repo<Widget>> {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ name: 'Anvil', slug: 'a', quantity: 2, active: true }),
+          baseWidget({ name: 'Anvil', slug: 'b', quantity: 4, active: true }),
+          baseWidget({ name: 'Barrel', slug: 'c', quantity: 4, active: false }),
+          baseWidget({ name: 'Crate', slug: 'd', quantity: 4, active: true }),
+        ]);
+        return repo;
+      }
+
+      it('returns each value of one field once', async () => {
+        const repo = await seeded();
+        const rows = await repo.distinct(['name'], {
+          orderBy: [{ field: 'name', direction: 'asc' }],
+        });
+
+        expect(rows).toEqual([{ name: 'Anvil' }, { name: 'Barrel' }, { name: 'Crate' }]);
+      });
+
+      it('deduplicates on the whole selected combination, not on each field', async () => {
+        const repo = await seeded();
+        const rows = await repo.distinct(['name', 'active'], {
+          orderBy: [
+            { field: 'name', direction: 'asc' },
+            { field: 'active', direction: 'asc' },
+          ],
+        });
+
+        expect(rows).toEqual([
+          { name: 'Anvil', active: true },
+          { name: 'Barrel', active: false },
+          { name: 'Crate', active: true },
+        ]);
+      });
+
+      it('applies where, orderBy, limit, and offset', async () => {
+        const repo = await seeded();
+        expect(
+          await repo.distinct(['quantity'], {
+            where: [{ field: 'active', op: 'eq', value: true }],
+            orderBy: [{ field: 'quantity', direction: 'desc' }],
+          }),
+        ).toEqual([{ quantity: 4 }, { quantity: 2 }]);
+
+        expect(
+          await repo.distinct(['name'], {
+            orderBy: [{ field: 'name', direction: 'asc' }],
+            limit: 1,
+            offset: 1,
+          }),
+        ).toEqual([{ name: 'Barrel' }]);
+      });
+
+      it('reads a null as one distinct value', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ releasedAt: null }),
+          baseWidget({ releasedAt: null }),
+          baseWidget({ releasedAt: new Date('2024-03-05T06:07:08.000Z') }),
+        ]);
+
+        const rows = await repo.distinct(['releasedAt'], {
+          orderBy: [{ field: 'releasedAt', direction: 'asc' }],
+        });
+        expect(rows).toEqual([
+          { releasedAt: new Date('2024-03-05T06:07:08.000Z') },
+          { releasedAt: null },
+        ]);
+      });
+
+      it('returns nothing on an empty table', async () => {
+        expect(await (await widgets()).distinct(['name'])).toEqual([]);
+      });
+    });
+
     // -------------------------------------------------------------- constraints
 
     describe('constraints', () => {
@@ -1245,6 +1581,65 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         await expect(
           repo.create({ ...baseWidget(), bogus: 1 } as Partial<Widget>),
         ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('rejects an aggregate that no engine could answer the same way', async () => {
+        const repo = await widgets();
+        const rejected = async (query: Parameters<typeof repo.aggregate>[0]): Promise<unknown> =>
+          repo.aggregate(query).catch((error: unknown) => error);
+
+        // Summing text, averaging a date, ordering a json value, and grouping by one are
+        // all things at least one engine would answer differently from the others.
+        expect(await rejected({ aggregates: { x: { fn: 'sum', field: 'name' } } })).toBeInstanceOf(
+          QueryError,
+        );
+        expect(
+          await rejected({ aggregates: { x: { fn: 'avg', field: 'releasedAt' } } }),
+        ).toBeInstanceOf(QueryError);
+        expect(await rejected({ aggregates: { x: { fn: 'max', field: 'meta' } } })).toBeInstanceOf(
+          QueryError,
+        );
+        expect(
+          await rejected({ groupBy: ['meta'], aggregates: { x: { fn: 'count' } } }),
+        ).toBeInstanceOf(QueryError);
+
+        // And the plain mistakes: an unknown field, an unknown function, a sum with no
+        // field, a having on a name that is not an aggregate, and an order by nothing.
+        expect(
+          await rejected({ aggregates: { x: { fn: 'count', field: 'nope' as 'name' } } }),
+        ).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({ aggregates: { x: { fn: 'median' as 'count', field: 'quantity' } } }),
+        ).toBeInstanceOf(QueryError);
+        expect(await rejected({ aggregates: { x: { fn: 'sum' } } })).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({
+            aggregates: { x: { fn: 'count' } },
+            having: [{ alias: 'quantity', op: 'gt', value: 1 }],
+          }),
+        ).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({
+            aggregates: { x: { fn: 'count' } },
+            orderBy: [{ field: 'quantity', direction: 'asc' }],
+          }),
+        ).toBeInstanceOf(QueryError);
+      });
+
+      it('rejects a distinct read that would not mean one thing on every engine', async () => {
+        const repo = await widgets();
+
+        // Postgres refuses to order a distinct read by a column it does not select, and
+        // SQLite silently picks a row per group, so the query is refused everywhere.
+        await expect(
+          repo.distinct(['name'], { orderBy: [{ field: 'quantity', direction: 'asc' }] }),
+        ).rejects.toBeInstanceOf(QueryError);
+
+        await expect(repo.distinct(['meta'])).rejects.toBeInstanceOf(QueryError);
+        await expect(repo.distinct([])).rejects.toBeInstanceOf(QueryError);
+        await expect(repo.distinct(['nope' as keyof Widget & string])).rejects.toBeInstanceOf(
+          QueryError,
+        );
       });
     });
 

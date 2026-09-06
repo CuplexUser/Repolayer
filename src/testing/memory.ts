@@ -1,3 +1,13 @@
+import {
+  planAggregate,
+  planDistinct,
+  type AggregateMap,
+  type AggregatePlan,
+  type AggregateQuery,
+  type AggregateRow,
+  type AggregateTerm,
+  type HavingTerm,
+} from '../core/aggregate.js';
 import { NotFoundError, QueryError, RepoError, UniqueConstraintError } from '../core/errors.js';
 import type { TableDiff } from '../core/introspect.js';
 import { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from '../core/keyset.js';
@@ -166,6 +176,27 @@ function asText(value: unknown): string {
 function valuesEqual(a: unknown, b: unknown): boolean {
   if (a === null || b === null) return a === b;
   return compareValues(a, b) === 0;
+}
+
+/**
+ * A stable key for one stored value, so grouping and `distinct` put exactly the values
+ * together that a SQL `GROUP BY` would. The type is part of the key because two fields of
+ * different declared types must never collapse into one group.
+ */
+function valueKey(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (value instanceof Date) return `date:${value.getTime()}`;
+  if (typeof value === 'string') return `string:${value}`;
+  if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') {
+    return `${typeof value}:${value.toString()}`;
+  }
+  /* c8 ignore next 2 -- unreachable: a json field is refused before a query reaches here */
+  return `json:${JSON.stringify(value)}`;
+}
+
+/** The key of a whole group, unambiguous however the individual values are spelled. */
+function groupKey(values: unknown[]): string {
+  return JSON.stringify(values.map(valueKey));
 }
 
 export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
@@ -417,14 +448,19 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
     });
   }
 
-  private select(query?: QueryOptions<T>): StoredRow[] {
-    const filters = normalizeWhere(query?.where);
+  /** The rows a `where` matches, in insertion order and with nothing else applied. */
+  private filtered(where: QueryOptions<T>['where']): StoredRow[] {
+    const filters = normalizeWhere(where);
     // Validated first, so a malformed filter fails on an empty table too.
     for (const filter of filters) this.validateFilter(filter, 0);
 
-    let rows = [...this.rows.values()].filter((row) =>
+    return [...this.rows.values()].filter((row) =>
       filters.every((filter) => this.matches(row, filter)),
     );
+  }
+
+  private select(query?: QueryOptions<T>): StoredRow[] {
+    let rows = this.filtered(query?.where);
     rows = this.sort(rows, query?.orderBy);
 
     if (query?.limit !== undefined) assertNonNegativeInteger(query.limit, 'limit');
@@ -453,6 +489,181 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
 
   async count(query?: QueryOptions<T>): Promise<number> {
     return Promise.resolve(this.select(query).length);
+  }
+
+  // ---------------------------------------------------------------- aggregation
+
+  /**
+   * Reduces one group to one aggregate value, in stored form.
+   *
+   * The NULL conventions are the engines' own, not this file's invention: a count is a
+   * number even over no rows, every other aggregate over no values is NULL, and NULLs in
+   * the column are skipped rather than treated as zeros.
+   */
+  private reduceTerm(term: AggregateTerm, rows: StoredRow[]): unknown {
+    if (term.field === null) return rows.length;
+
+    let values: unknown[] = rows
+      .map((row) => row[term.field as string] ?? null)
+      .filter((value) => value !== null);
+    if (term.distinct) {
+      const seen = new Map<string, unknown>();
+      for (const value of values) if (!seen.has(valueKey(value))) seen.set(valueKey(value), value);
+      values = [...seen.values()];
+    }
+
+    if (term.fn === 'count') return values.length;
+    if (values.length === 0) return null;
+
+    switch (term.fn) {
+      case 'sum':
+        return values.reduce((total: number, value) => total + Number(value), 0);
+      case 'avg':
+        // Averaged as a double, which is what the compiler makes every engine do too.
+        return values.reduce((total: number, value) => total + Number(value), 0) / values.length;
+      case 'min':
+        return values.reduce((best, value) => (compareValues(value, best) < 0 ? value : best));
+      default:
+        return values.reduce((best, value) => (compareValues(value, best) > 0 ? value : best));
+    }
+  }
+
+  /** Applies `having` to one already-reduced group, with the same NULL rules as `where`. */
+  private matchesHaving(having: HavingTerm[], values: Record<string, unknown>): boolean {
+    return having.every(({ term, op, value }) => {
+      const actual = values[term.alias] ?? null;
+
+      if (op === 'isNull') {
+        const wantNull = value === undefined ? true : Boolean(value);
+        return wantNull ? actual === null : actual !== null;
+      }
+      if (value === null || value === undefined) {
+        return op === 'eq' ? actual === null : actual !== null;
+      }
+
+      const bound = toDb(value, term.type, 'memory', term.alias);
+      if (op === 'eq') return actual !== null && valuesEqual(actual, bound);
+      // A group whose aggregate is NULL is genuinely "not this value", exactly as `ne` on
+      // a column keeps its nulls.
+      if (op === 'ne') return actual === null || !valuesEqual(actual, bound);
+      if (actual === null) return false;
+
+      const order = compareValues(actual, bound);
+      if (op === 'gt') return order > 0;
+      if (op === 'gte') return order >= 0;
+      if (op === 'lt') return order < 0;
+      return order <= 0;
+    });
+  }
+
+  /** Orders reduced groups the way `orderByClause` does: nulls last on asc, first on desc. */
+  private sortGroups(
+    records: Record<string, unknown>[],
+    plan: AggregatePlan,
+  ): Record<string, unknown>[] {
+    if (plan.orderBy.length === 0) return records;
+
+    return [...records].sort((left, right) => {
+      for (const { group, term, direction } of plan.orderBy) {
+        const name = group === null ? (term as AggregateTerm).alias : group.field;
+        const a = left[name] ?? null;
+        const b = right[name] ?? null;
+        if (a === null && b === null) continue;
+        if (a === null) return direction === 'asc' ? 1 : -1;
+        if (b === null) return direction === 'asc' ? -1 : 1;
+        const order = compareValues(a, b);
+        if (order !== 0) return direction === 'asc' ? order : -order;
+      }
+      return 0;
+    });
+  }
+
+  async aggregate<A extends AggregateMap<T>, G extends keyof T & string = never>(
+    query: AggregateQuery<T, A, G>,
+  ): Promise<AggregateRow<T, G, A>[]> {
+    // The same plan the SQL adapters compile, which is what keeps one set of rules about
+    // which aggregate queries are legal rather than two.
+    const plan = planAggregate<T>(this.schema, query);
+    const rows = this.filtered(query.where);
+
+    const grouped = new Map<string, StoredRow[]>();
+    if (plan.groups.length === 0) {
+      // An ungrouped aggregate is one group even over no rows, so an empty table answers
+      // with a zero count rather than with no rows at all. Both engines do this.
+      grouped.set('', rows);
+    } else {
+      for (const row of rows) {
+        const key = groupKey(plan.groups.map((group) => row[group.field] ?? null));
+        const bucket = grouped.get(key);
+        if (bucket === undefined) grouped.set(key, [row]);
+        else bucket.push(row);
+      }
+    }
+
+    const reduced: Record<string, unknown>[] = [];
+    for (const bucket of grouped.values()) {
+      const record: Record<string, unknown> = {};
+      const first = bucket[0];
+      for (const group of plan.groups) record[group.field] = first?.[group.field] ?? null;
+      for (const term of plan.terms) record[term.alias] = this.reduceTerm(term, bucket);
+      if (this.matchesHaving(plan.having, record)) reduced.push(record);
+    }
+
+    const sorted = this.sortGroups(reduced, plan);
+    const start = query.offset ?? 0;
+    const end = query.limit === undefined ? undefined : start + query.limit;
+
+    return Promise.resolve(
+      sorted.slice(start, end).map((record) => {
+        const out: Record<string, unknown> = {};
+        for (const group of plan.groups) {
+          out[group.field] = fromDb(
+            cloneValue(record[group.field]),
+            group.type,
+            'memory',
+            group.field,
+          );
+        }
+        for (const term of plan.terms) {
+          const value = record[term.alias] ?? null;
+          out[term.alias] =
+            value === null ? null : fromDb(cloneValue(value), term.type, 'memory', term.alias);
+        }
+        return out as AggregateRow<T, G, A>;
+      }),
+    );
+  }
+
+  async distinct<K extends keyof T & string>(
+    fields: readonly K[],
+    query?: QueryOptions<T>,
+  ): Promise<Pick<T, K>[]> {
+    const groups = planDistinct<T>(this.schema, fields, query);
+
+    const seen = new Map<string, StoredRow>();
+    for (const row of this.filtered(query?.where)) {
+      const key = groupKey(groups.map((group) => row[group.field] ?? null));
+      if (!seen.has(key)) seen.set(key, row);
+    }
+
+    const sorted = this.sort([...seen.values()], query?.orderBy);
+    const start = query?.offset ?? 0;
+    const end = query?.limit === undefined ? undefined : start + query.limit;
+
+    return Promise.resolve(
+      sorted.slice(start, end).map((row) => {
+        const out: Record<string, unknown> = {};
+        for (const group of groups) {
+          out[group.field] = fromDb(
+            cloneValue(row[group.field] ?? null),
+            group.type,
+            'memory',
+            group.field,
+          );
+        }
+        return out as Pick<T, K>;
+      }),
+    );
   }
 
   stream(query?: QueryOptions<T>, opts?: StreamOptions): AsyncIterable<T> {
