@@ -176,6 +176,43 @@ describe('diffTable', () => {
       expect(diff.findings.find((f) => f.kind === 'typeIncompatible')?.field).toBe('createdAt');
     });
 
+    it('checks a binary field against each engine own byte types', () => {
+      const bytes = defineSchema({
+        id: { type: 'string', primaryKey: true },
+        body: { type: 'binary' },
+      });
+      const verdict = (dialect: Exclude<Dialect, 'memory'>, dataType: string) => {
+        const shape: TableShape = {
+          exists: true,
+          columns: [
+            {
+              column: 'id',
+              dataType: dialect === 'sqlite' ? 'TEXT' : dialect === 'postgres' ? 'text' : 'varchar',
+              nullable: false,
+              primaryKey: true,
+              hasDefault: false,
+              ...(dialect === 'mysql' ? { collation: 'utf8mb4_bin' } : {}),
+            },
+            { column: 'body', dataType, nullable: false, primaryKey: false, hasDefault: false },
+          ],
+          uniqueColumns: [],
+        };
+        const findings = diffTable(bytes, 't', shape, dialect).findings;
+        return findings.length === 0 ? 'ok' : findings.map((f) => f.kind).join(',');
+      };
+
+      expect(verdict('sqlite', 'BLOB')).toBe('ok');
+      expect(verdict('sqlite', 'TEXT')).toBe('typeIncompatible');
+      expect(verdict('postgres', 'bytea')).toBe('ok');
+      expect(verdict('postgres', 'text')).toBe('typeIncompatible');
+      for (const ok of ['longblob', 'mediumblob', 'blob', 'varbinary']) {
+        expect(verdict('mysql', ok), ok).toBe('ok');
+      }
+      // BINARY(n) pads a short value with zero bytes, so it does not round trip.
+      expect(verdict('mysql', 'binary')).toBe('typeIncompatible');
+      expect(verdict('mysql', 'longtext')).toBe('typeIncompatible');
+    });
+
     it('warns rather than fails on a type it has no opinion on', () => {
       const shape = shapeFor('postgres', [{ column: 'slug', dataType: 'citext' }]);
       const diff = diffTable(schema, 'widgets', shape, 'postgres');

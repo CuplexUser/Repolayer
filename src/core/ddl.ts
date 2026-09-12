@@ -27,6 +27,8 @@ function sqliteType(type: FieldType): string {
       return 'TEXT';
     case 'json':
       return 'TEXT';
+    case 'binary':
+      return 'BLOB';
   }
 }
 
@@ -69,6 +71,11 @@ function mysqlType(type: FieldType, indexed: boolean): string {
       // on MariaDB, SQLite, and MemoryRepo. MariaDB's JSON is a LONGTEXT alias already, so
       // this is what that flavor was doing all along.
       return 'LONGTEXT';
+    case 'binary':
+      // The same split as a string: MySQL cannot put a unique index on a BLOB without a
+      // prefix length, which would make two values sharing a prefix collide. VARBINARY
+      // compares every byte and never pads, which BINARY(n) does with zeros.
+      return indexed ? `VARBINARY(${MYSQL_KEY_LENGTH})` : 'LONGBLOB';
   }
 }
 
@@ -86,6 +93,8 @@ function postgresType(type: FieldType): string {
       return 'TIMESTAMPTZ';
     case 'json':
       return 'JSONB';
+    case 'binary':
+      return 'BYTEA';
   }
 }
 

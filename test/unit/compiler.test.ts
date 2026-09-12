@@ -200,6 +200,20 @@ describe('createTableStatements', () => {
     expect(sql).toContain('released_at TIMESTAMPTZ');
   });
 
+  it('stores binary as BLOB on sqlite and BYTEA on postgres', () => {
+    const bytes = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      digest: { type: 'binary', unique: true },
+      body: { type: 'binary', nullable: true },
+    });
+    const [sqlite] = createTableStatements(bytes, 't', 'sqlite');
+    expect(sqlite).toContain('digest BLOB NOT NULL UNIQUE');
+    expect(sqlite).toMatch(/body BLOB\n/);
+    const [postgres] = createTableStatements(bytes, 't', 'postgres');
+    expect(postgres).toContain('digest BYTEA NOT NULL UNIQUE');
+    expect(postgres).toMatch(/body BYTEA\n/);
+  });
+
   it('uses each engine own auto-increment feature', () => {
     const numeric = defineSchema({
       id: { type: 'integer', primaryKey: true },

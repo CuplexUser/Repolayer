@@ -47,6 +47,27 @@ describe('defineSchema', () => {
     ).toThrow(SchemaError);
   });
 
+  it('types a binary field as Uint8Array', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- used as a type below
+    const schema = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      digest: { type: 'binary' },
+      thumbnail: { type: 'binary', nullable: true },
+    });
+    const row: Infer<typeof schema> = { id: 'a', digest: new Uint8Array(1), thumbnail: null };
+    expect(row.digest).toBeInstanceOf(Uint8Array);
+  });
+
+  it('rejects a binary primary key and a binary default', () => {
+    expect(() => defineSchema({ id: { type: 'binary', primaryKey: true } })).toThrow(SchemaError);
+    expect(() =>
+      defineSchema({
+        id: { type: 'string', primaryKey: true },
+        digest: { type: 'binary', default: new Uint8Array(1) },
+      }),
+    ).toThrow(/binary and declares a default/);
+  });
+
   it('rejects a nullable primary key and an empty schema', () => {
     expect(() => defineSchema({ a: { type: 'string', primaryKey: true, nullable: true } })).toThrow(
       SchemaError,
@@ -120,6 +141,50 @@ describe('serialization', () => {
     expect(() => toDb(Number.NaN, 'number', 'sqlite', 'weight')).toThrow(QueryError);
     expect(() => toDb(new Date('nonsense'), 'date', 'sqlite', 'at')).toThrow(QueryError);
     expect(() => toDb(5, 'string', 'sqlite', 'name')).toThrow(QueryError);
+  });
+
+  it('binds binary as a Buffer where the driver needs one, keeping a view to its own bytes', () => {
+    const backing = Uint8Array.from([9, 1, 2, 3, 9]);
+    const view = backing.subarray(1, 4);
+
+    for (const dialect of ['postgres', 'mysql'] as const) {
+      const bound = toDb(view, 'binary', dialect, 'f') as Buffer;
+      expect(Buffer.isBuffer(bound)).toBe(true);
+      expect([...bound]).toEqual([1, 2, 3]);
+      // A view over the caller's memory, not a copy.
+      expect(bound.buffer).toBe(backing.buffer);
+    }
+    expect(toDb(view, 'binary', 'sqlite', 'f')).toBe(view);
+  });
+
+  it('copies binary into and out of MemoryRepo so the store cannot be reached', () => {
+    const input = Buffer.from([1, 2, 3]);
+    const stored = toDb(input, 'binary', 'memory', 'f') as Uint8Array;
+    input[0] = 99;
+    expect([...stored]).toEqual([1, 2, 3]);
+
+    const read = fromDb(stored, 'binary', 'memory', 'f') as Uint8Array;
+    read[1] = 99;
+    expect([...stored]).toEqual([1, 2, 3]);
+  });
+
+  it('reads a driver Buffer back as a plain Uint8Array over the same memory', () => {
+    const buffer = Buffer.from([4, 5, 6]);
+    const read = fromDb(buffer, 'binary', 'postgres', 'f') as Uint8Array;
+    expect(Object.getPrototypeOf(read)).toBe(Uint8Array.prototype);
+    expect(read.buffer).toBe(buffer.buffer);
+    expect([...read]).toEqual([4, 5, 6]);
+
+    const plain = Uint8Array.from([7]);
+    expect(fromDb(plain, 'binary', 'sqlite', 'f')).toBe(plain);
+  });
+
+  it('refuses anything but bytes for a binary field, in either direction', () => {
+    expect(() => toDb('abc', 'binary', 'sqlite', 'f')).toThrow(QueryError);
+    expect(() => toDb([1, 2], 'binary', 'postgres', 'f')).toThrow(/declared binary/);
+    expect(() => fromDb('\\x0102', 'binary', 'postgres', 'f')).toThrow(/driver returned/);
+    // A typed array that is not bytes is described as such rather than as "a object".
+    expect(() => toDb(new Uint8Array(1), 'string', 'sqlite', 'f')).toThrow(/binary data/);
   });
 
   it('treats null and undefined alike on the way in', () => {

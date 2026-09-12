@@ -24,6 +24,7 @@ export const widgetSchema = defineSchema({
   weight: { type: 'number' },
   active: { type: 'boolean' },
   meta: { type: 'json', nullable: true },
+  payload: { type: 'binary', nullable: true },
   releasedAt: { type: 'date', nullable: true, column: 'released_at' },
   createdAt: { type: 'date', column: 'created_at' },
   updatedAt: { type: 'date', column: 'updated_at' },
@@ -37,6 +38,7 @@ export interface Widget {
   weight: number;
   active: boolean;
   meta: unknown | null;
+  payload: Uint8Array | null;
   releasedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -54,6 +56,7 @@ export const widerWidgetSchema = defineSchema({
   weight: { type: 'number' },
   active: { type: 'boolean' },
   meta: { type: 'json', nullable: true },
+  payload: { type: 'binary', nullable: true },
   releasedAt: { type: 'date', nullable: true, column: 'released_at' },
   createdAt: { type: 'date', column: 'created_at' },
   updatedAt: { type: 'date', column: 'updated_at' },
@@ -69,6 +72,20 @@ export const noteSchema = defineSchema({
 export interface Note {
   id: string;
   body: string;
+}
+
+/**
+ * A unique binary column, the one shape of binary field `widgetSchema` does not cover. On
+ * MySQL it is the only path to a VARBINARY column, and to a duplicate key reported over one.
+ */
+const digestSchema = defineSchema({
+  id: { type: 'string', primaryKey: true },
+  digest: { type: 'binary', unique: true },
+});
+
+interface Digest {
+  id: string;
+  digest: Uint8Array;
 }
 
 /** Capability groups an adapter may declare unsupported, with a stated reason. */
@@ -135,6 +152,7 @@ const baseWidget = (overrides: Partial<Widget> = {}): Partial<Widget> => ({
   weight: 1.5,
   active: true,
   meta: null,
+  payload: null,
   releasedAt: null,
   ...overrides,
 });
@@ -404,9 +422,64 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
 
       it('distinguishes null from absent for a nullable field', async () => {
         const repo = await widgets();
-        const created = await repo.create(baseWidget({ releasedAt: null, meta: null }));
+        const created = await repo.create(
+          baseWidget({ releasedAt: null, meta: null, payload: null }),
+        );
         expect(created.releasedAt).toBeNull();
         expect(created.meta).toBeNull();
+        expect(created.payload).toBeNull();
+      });
+
+      it('round trips binary as a plain Uint8Array, including every byte value', async () => {
+        const repo = await widgets();
+        // Every byte value, so a zero byte, a high bit, and anything a text encoding would
+        // touch are all in one value.
+        const every = Uint8Array.from({ length: 256 }, (_, i) => i);
+        const created = await repo.create(baseWidget({ payload: every }));
+        const found = await repo.findById(created.id);
+
+        for (const value of [created.payload, found?.payload]) {
+          // Exactly Uint8Array, not Buffer: pg and mysql2 return one, and a Buffer compares
+          // unequal to a plain array and serializes to JSON differently.
+          expect(Object.getPrototypeOf(value)).toBe(Uint8Array.prototype);
+          expect(value).toEqual(every);
+        }
+      });
+
+      it('round trips empty and large binary values', async () => {
+        const repo = await widgets();
+        const large = Uint8Array.from({ length: 1024 * 1024 }, (_, i) => (i * 31) % 251);
+        const empty = await repo.create(baseWidget({ payload: new Uint8Array(0) }));
+        const big = await repo.create(baseWidget({ payload: large }));
+
+        // Empty is a value, not a null.
+        expect((await repo.findById(empty.id))?.payload).toEqual(new Uint8Array(0));
+        expect((await repo.findById(big.id))?.payload).toEqual(large);
+      });
+
+      it('binds only the bytes a Buffer or a subarray view covers', async () => {
+        const repo = await widgets();
+        const backing = Uint8Array.from([9, 9, 1, 2, 3, 9, 9]);
+        const fromView = await repo.create(baseWidget({ payload: backing.subarray(2, 5) }));
+        const fromBuffer = await repo.create(baseWidget({ payload: Buffer.from([4, 5, 6]) }));
+
+        expect((await repo.findById(fromView.id))?.payload).toEqual(Uint8Array.from([1, 2, 3]));
+        const found = (await repo.findById(fromBuffer.id))?.payload;
+        expect(Object.getPrototypeOf(found)).toBe(Uint8Array.prototype);
+        expect(found).toEqual(Uint8Array.from([4, 5, 6]));
+      });
+
+      it('keeps stored bytes independent of the arrays passed in and handed back', async () => {
+        const repo = await widgets();
+        const input = Uint8Array.from([1, 2, 3]);
+        const created = await repo.create(baseWidget({ payload: input }));
+
+        input[0] = 99;
+        (created.payload as Uint8Array)[1] = 99;
+        const first = await repo.findById(created.id);
+        (first?.payload as Uint8Array)[2] = 99;
+
+        expect((await repo.findById(created.id))?.payload).toEqual(Uint8Array.from([1, 2, 3]));
       });
 
       it('round trips empty strings, zero, and negative numbers', async () => {
@@ -431,6 +504,13 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         const repo = await widgets();
         await expect(
           repo.create(baseWidget({ quantity: 'seven' as unknown as number })),
+        ).rejects.toBeInstanceOf(QueryError);
+        // Neither text nor a plain array of numbers is bytes.
+        await expect(
+          repo.create(baseWidget({ payload: 'bytes' as unknown as Uint8Array })),
+        ).rejects.toBeInstanceOf(QueryError);
+        await expect(
+          repo.create(baseWidget({ payload: [1, 2, 3] as unknown as Uint8Array })),
         ).rejects.toBeInstanceOf(QueryError);
       });
     });
@@ -566,6 +646,37 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         await expect(
           repo.findMany({ where: [{ field: 'slug', op: 'in', value: 'a' }] }),
         ).rejects.toBeInstanceOf(QueryError);
+      });
+
+      it('compares binary values on their exact bytes', async () => {
+        const repo = await widgets();
+        await repo.createMany([
+          baseWidget({ slug: 'short', payload: Uint8Array.from([1, 2]) }),
+          baseWidget({ slug: 'long', payload: Uint8Array.from([1, 2, 0]) }),
+          baseWidget({ slug: 'other', payload: Uint8Array.from([255]) }),
+          baseWidget({ slug: 'none', payload: null }),
+        ]);
+        const slugs = async (filter: Filter<Widget>): Promise<string[]> =>
+          (await repo.findMany({ where: [filter] })).map((r) => r.slug).sort();
+        const short = Uint8Array.from([1, 2]);
+
+        // A trailing zero byte makes a different value, not a padded copy of the same one.
+        expect(await slugs({ field: 'payload', op: 'eq', value: short })).toEqual(['short']);
+        // `ne` keeps the null row, as it does for every other type.
+        expect(await slugs({ field: 'payload', op: 'ne', value: short })).toEqual([
+          'long',
+          'none',
+          'other',
+        ]);
+        expect(
+          await slugs({ field: 'payload', op: 'in', value: [short, Uint8Array.from([255])] }),
+        ).toEqual(['other', 'short']);
+        expect(await slugs({ field: 'payload', op: 'nin', value: [short] })).toEqual([
+          'long',
+          'none',
+          'other',
+        ]);
+        expect(await slugs({ field: 'payload', op: 'isNull' })).toEqual(['none']);
       });
     });
 
@@ -841,10 +952,15 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         const repo = await widgets();
         const meta = { tags: ['a'], n: 1 };
         const released = new Date('2024-03-05T06:07:08.123Z');
-        await repo.create(baseWidget({ meta, releasedAt: released, active: false, weight: -2.5 }));
+        const payload = Uint8Array.from([0, 255, 7]);
+        await repo.create(
+          baseWidget({ meta, payload, releasedAt: released, active: false, weight: -2.5 }),
+        );
 
         const [row] = await collect(repo.stream());
         expect(row?.meta).toEqual(meta);
+        expect(Object.getPrototypeOf(row?.payload)).toBe(Uint8Array.prototype);
+        expect(row?.payload).toEqual(payload);
         expect(row?.releasedAt?.getTime()).toBe(released.getTime());
         expect(row?.active).toBe(false);
         expect(row?.weight).toBe(-2.5);
@@ -1506,6 +1622,26 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         expect(error).toBeInstanceOf(UniqueConstraintError);
         expect((error as UniqueConstraintError).fields).toContain('slug');
       });
+
+      it('enforces a unique binary field on exact bytes', async () => {
+        const repo = await adapter.createRepo<Digest>({
+          schema: digestSchema,
+          table: uniqueTable('digests'),
+        });
+        await repo.create({ digest: Uint8Array.from([1, 2, 3]) });
+        // A longer value sharing a prefix is a different value, which a prefix index or a
+        // zero-padded BINARY column would get wrong.
+        const longer = await repo.create({ digest: Uint8Array.from([1, 2, 3, 0]) });
+
+        const error = await repo
+          .create({ digest: Uint8Array.from([1, 2, 3]) })
+          .catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(UniqueConstraintError);
+        expect((error as UniqueConstraintError).fields).toContain('digest');
+
+        const found = await repo.findOne({ where: { digest: Uint8Array.from([1, 2, 3, 0]) } });
+        expect(found?.id).toBe(longer.id);
+      });
     });
 
     // ------------------------------------------------------- ids and timestamps
@@ -1640,6 +1776,52 @@ export function runConformanceSuite(adapter: ConformanceAdapter): void {
         await expect(repo.distinct(['nope' as keyof Widget & string])).rejects.toBeInstanceOf(
           QueryError,
         );
+      });
+
+      it('rejects an operator or a sort the field type does not support everywhere', async () => {
+        const repo = await widgets();
+        await repo.create(baseWidget({ meta: { x: 1 }, payload: Uint8Array.from([1]) }));
+        const rejected = async (query: QueryOptions<Widget>): Promise<unknown> =>
+          repo.findMany(query).catch((error: unknown) => error);
+        const bytes = Uint8Array.from([1]);
+
+        // A pattern on a number or a date matches its stored text on SQLite and is a driver
+        // error on Postgres, so it is refused everywhere, on a table that has rows to match.
+        expect(
+          await rejected({ where: [{ field: 'quantity', op: 'like', value: '3%' }] }),
+        ).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({ where: [{ field: 'releasedAt', op: 'ilike', value: '2024%' }] }),
+        ).toBeInstanceOf(QueryError);
+
+        // Postgres orders jsonb as documents and the other engines order text.
+        expect(
+          await rejected({ where: [{ field: 'meta', op: 'gt', value: { x: 0 } }] }),
+        ).toBeInstanceOf(QueryError);
+        expect(await rejected({ orderBy: [{ field: 'meta', direction: 'asc' }] })).toBeInstanceOf(
+          QueryError,
+        );
+
+        // Binary supports equality and null checks, and nothing else yet.
+        expect(
+          await rejected({ where: [{ field: 'payload', op: 'like', value: '%' }] }),
+        ).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({ where: [{ field: 'payload', op: 'gte', value: bytes }] }),
+        ).toBeInstanceOf(QueryError);
+        expect(
+          await rejected({ orderBy: [{ field: 'payload', direction: 'desc' }] }),
+        ).toBeInstanceOf(QueryError);
+        await expect(
+          repo.findPage({ orderBy: [{ field: 'payload', direction: 'asc' }] }),
+        ).rejects.toBeInstanceOf(QueryError);
+        await expect(
+          repo.aggregate({ groupBy: ['payload'], aggregates: { n: { fn: 'count' } } }),
+        ).rejects.toBeInstanceOf(QueryError);
+        await expect(
+          repo.aggregate({ aggregates: { top: { fn: 'max', field: 'payload' } } }),
+        ).rejects.toBeInstanceOf(QueryError);
+        await expect(repo.distinct(['payload'])).rejects.toBeInstanceOf(QueryError);
       });
     });
 

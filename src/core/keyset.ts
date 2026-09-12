@@ -1,5 +1,6 @@
 import { QueryError } from './errors.js';
 import type { Filter, OrderBy } from './query.js';
+import { assertOrderable } from './rules.js';
 import type { FieldType, Schema } from './schema.js';
 
 /**
@@ -51,12 +52,9 @@ export function resolveSortKeys<T>(
           `${schema.fieldNames.join(', ')}`,
       );
     }
-    if (schema.types[key.field] === 'json') {
-      throw new QueryError(
-        `Cannot page by "${String(key.field)}": a json field has no total order, so a ` +
-          `cursor built from it could not be compared reliably.`,
-      );
-    }
+    // A cursor is only as reliable as the order it compares against, so a type with no
+    // order every engine agrees on cannot be a sort key.
+    assertOrderable(schema, key.field, 'a page cursor');
   }
 
   if (!keys.some((key) => key.field === pk)) keys.push({ field: pk, direction: 'asc' });
@@ -90,8 +88,9 @@ function encodeValue(value: unknown, type: FieldType, field: string): unknown {
     case 'boolean':
       return value;
     case 'json':
-      /* c8 ignore next 2 -- resolveSortKeys rejects json keys before this is reachable */
-      throw new QueryError(`Cannot page by json field "${field}"`);
+    case 'binary':
+      /* c8 ignore next 2 -- resolveSortKeys rejects these keys before this is reachable */
+      throw new QueryError(`Cannot page by ${type} field "${field}"`);
   }
 }
 
@@ -122,8 +121,9 @@ function decodeValue(value: unknown, type: FieldType, field: string): unknown {
       }
       return value;
     case 'json':
-      /* c8 ignore next 2 -- resolveSortKeys rejects json keys before this is reachable */
-      throw new QueryError(`Cannot page by json field "${field}"`);
+    case 'binary':
+      /* c8 ignore next 2 -- resolveSortKeys rejects these keys before this is reachable */
+      throw new QueryError(`Cannot page by ${type} field "${field}"`);
   }
 }
 

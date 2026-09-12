@@ -28,8 +28,14 @@ constraint.
   Every generated `ORDER BY` states the position explicitly, and since MySQL has no
   `NULLS LAST` syntax at all it compiles to an `ORDER BY (col IS NULL), col` prefix that
   produces the same order.
-- **Storage types.** Booleans, dates, and JSON are stored differently on each engine and
-  round trip through real `boolean`, `Date`, and parsed JSON values on all of them.
+- **Storage types.** Booleans, dates, JSON, and bytes are stored differently on each engine
+  and round trip through real `boolean`, `Date`, parsed JSON, and plain `Uint8Array` values on
+  all of them. Bytes are `BLOB` on SQLite, `BYTEA` on Postgres, and `LONGBLOB` on MySQL, and
+  a `Buffer` from pg or mysql2 is handed back as a `Uint8Array` over the same memory.
+- **Which operators a type takes.** `like` on a number or a date matches its stored text on
+  SQLite and is an error on Postgres, and ordering a json value compares documents on
+  Postgres and text elsewhere. Both are refused on every engine; the full table is in
+  [queries.md](queries.md#operators-by-type).
 - **Aggregate results.** `avg` is computed in double precision everywhere, since Postgres
   would otherwise answer an integer average as a sixteen-place `numeric` and MySQL as a
   four-place `DECIMAL`. A count arrives as a `number` whatever the driver makes of a BIGINT,
@@ -85,6 +91,13 @@ things that genuinely differ between them, so `driver: 'mysql'` is correct for e
   pass, and they are applied whether the pool is repolayer's or yours.
 - **Dates are stored as UTC `DATETIME(6)`** and parsed back as UTC explicitly, so a timestamp
   does not shift when the server's timezone does.
+- **A unique binary column holds at most 255 bytes.** MySQL cannot put a unique index on a
+  `BLOB` without a prefix length, under which two values sharing a prefix would collide, so
+  `ensureTable` creates a unique binary field as `VARBINARY(255)` and any other as
+  `LONGBLOB`. That is plenty for a hash or a token; a longer value is refused by the server
+  on this engine only, the same limit a unique string column has. If a migration tool created
+  the column as `BINARY(n)`, `verifyTable()` reports it: `BINARY` pads a short value with zero
+  bytes, so it does not read back what was written.
 - **`json` columns are `LONGTEXT`, not the native `JSON` type.** A native JSON column holds a
   normalized document, and MySQL does not match one against the text repolayer binds, so `eq`
   and `ne` on a json field would answer differently there than on MariaDB, SQLite, and

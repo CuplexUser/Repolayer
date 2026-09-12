@@ -100,6 +100,8 @@ const POSTGRES_TYPES: Record<FieldType, TypeRules> = {
     // parsed it. A text column is parsed by nobody, so the field yields a raw string.
     bad: ['text', 'character varying'],
   },
+  // A text column rejects a zero byte outright and runs everything else through an encoding.
+  binary: { ok: ['bytea'], bad: ['text', 'character varying'] },
 };
 
 const MYSQL_TYPES: Record<FieldType, TypeRules> = {
@@ -120,9 +122,15 @@ const MYSQL_TYPES: Record<FieldType, TypeRules> = {
     // `toDb` produced stops matching. This is why `ddl.ts` emits LONGTEXT instead.
     bad: ['json'],
   },
+  binary: {
+    ok: ['longblob', 'mediumblob', 'blob', 'tinyblob', 'varbinary'],
+    // BINARY(n) pads a shorter value with zero bytes, so what comes back is not what went in.
+    // A text column would run the bytes through a character set.
+    bad: ['binary', 'varchar', 'char', 'text', 'tinytext', 'mediumtext', 'longtext', 'json'],
+  },
 };
 
-/** Expected SQLite affinity per field type. SQLite has five, and repolayer uses three. */
+/** Expected SQLite affinity per field type. SQLite has five, and repolayer uses four. */
 const SQLITE_AFFINITY: Record<FieldType, string[]> = {
   string: ['text'],
   number: ['real', 'numeric'],
@@ -130,6 +138,7 @@ const SQLITE_AFFINITY: Record<FieldType, string[]> = {
   boolean: ['integer'],
   date: ['text'],
   json: ['text'],
+  binary: ['blob'],
 };
 
 /**

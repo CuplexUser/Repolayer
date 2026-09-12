@@ -120,6 +120,7 @@ const puzzleSchema = defineSchema({
   difficulty: { type: 'integer' },
   solved:     { type: 'boolean' },
   tags:       { type: 'json',    nullable: true },
+  thumbnail:  { type: 'binary',  nullable: true },
   solvedAt:   { type: 'date',    nullable: true, column: 'solved_at' },
   createdAt:  { type: 'date',    column: 'created_at' },
   updatedAt:  { type: 'date',    column: 'updated_at' },
@@ -128,20 +129,28 @@ const puzzleSchema = defineSchema({
 
 | field property | meaning |
 |---|---|
-| `type` | `'string'`, `'number'`, `'integer'`, `'boolean'`, `'date'`, or `'json'` |
+| `type` | `'string'`, `'number'`, `'integer'`, `'boolean'`, `'date'`, `'json'`, or `'binary'` |
 | `column` | column name in the database. Defaults to the field name |
 | `primaryKey` | marks the single primary key. Exactly one field must have it |
 | `nullable` | allows null, and widens the inferred type |
 | `unique` | adds a unique constraint to the generated DDL |
 | `default` | a DDL default applied by `ensureTable()`, not applied client side |
 
-Anything more exotic than the six types belongs in a `json` field rather than in a
+Anything more exotic than the seven types belongs in a `json` field rather than in a
 dialect-specific column type.
+
+A `binary` field holds bytes. It takes a `Uint8Array` or a `Buffer`, and always reads back as
+a plain `Uint8Array`, on every engine, even where the driver returns a `Buffer`. Nothing is
+copied on the way in or out; `Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)`
+turns one back into a `Buffer` without copying either. It supports equality and null checks
+only (see [queries.md](queries.md#operators-by-type)), and it cannot be the primary key or
+declare a `default`.
 
 Validation happens once, at definition time, so a malformed schema fails at module load
 rather than on a customer's first request. `defineSchema` throws `SchemaError` for an unknown
-type, no fields at all, two primary keys, a nullable primary key, two fields mapped onto one
-column, or a column name that is not a plain identifier. That last rule exists because
+type, no fields at all, two primary keys, a nullable or binary primary key, a binary field
+with a `default`, two fields mapped onto one column, or a column name that is not a plain
+identifier. That last rule exists because
 repolayer never quotes identifiers, which also means a column cannot be named after a
 reserved word such as `order`.
 
@@ -150,11 +159,11 @@ reserved word such as `order`.
 ```ts
 type Puzzle = Infer<typeof puzzleSchema>;
 // { id: string; title: string; difficulty: number; solved: boolean;
-//   tags: unknown | null; solvedAt: Date | null; createdAt: Date; ... }
+//   tags: unknown | null; thumbnail: Uint8Array | null; solvedAt: Date | null; ... }
 ```
 
-`string`, `number` and `integer`, `boolean`, and `date` map to `string`, `number`, `boolean`,
-and `Date`. A `json` field is `unknown`, so the compiler makes you narrow it. Fields declared
+`string`, `number` and `integer`, `boolean`, `date`, and `binary` map to `string`, `number`,
+`boolean`, `Date`, and `Uint8Array`. A `json` field is `unknown`, so the compiler makes you narrow it. Fields declared
 `nullable: true` widen to include `null`, which is what tells you where absent values have to
 be handled.
 
@@ -285,7 +294,8 @@ findPage(query?: QueryOptions<T>, opts?: PageOptions): Promise<Page<T>>;
 
 Keyset pagination with an opaque cursor token. `limit` defaults to 50. Unlike a stream it
 holds nothing between calls, so the next page can be fetched by a different process minutes
-later. Passing an `offset` is rejected, because mixing the two is always a mistake. See
+later. Passing an `offset` is rejected, because mixing the two is always a mistake, and so is
+sorting by a `json` or `binary` field, which has no order every engine agrees on. See
 [streaming.md](streaming.md#paging) for what the token carries and why the sort is made
 total.
 
@@ -518,7 +528,7 @@ try {
 | `RepoError` | the base class of all the others | `message`, `cause` |
 | `NotFoundError` | `update` or `delete` finds no row with that id | `table`, `id` |
 | `UniqueConstraintError` | a unique constraint or primary key rejects a write | `table`, `fields` |
-| `QueryError` | a query cannot be compiled: unknown field, bad operator, malformed value | |
+| `QueryError` | a query cannot be compiled: unknown field, bad operator, an operator or sort the field's type does not support, malformed value | |
 | `ConnectionError` | a connection could not be opened, borrowed, or used | |
 | `SchemaError` | the schema descriptor itself is invalid | |
 

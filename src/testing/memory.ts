@@ -11,6 +11,7 @@ import {
 import { NotFoundError, QueryError, RepoError, UniqueConstraintError } from '../core/errors.js';
 import type { TableDiff } from '../core/introspect.js';
 import { decodeCursor, encodeCursor, keysetFilter, resolveSortKeys } from '../core/keyset.js';
+import { assertOperator, assertOrderable } from '../core/rules.js';
 import {
   assertNonNegativeInteger,
   normalizeWhere,
@@ -161,16 +162,18 @@ function compareValues(a: unknown, b: unknown): number {
   if (typeof a === 'boolean' && typeof b === 'boolean') {
     return (a ? 1 : 0) - (b ? 1 : 0);
   }
+  // Byte by byte, the way every engine compares a BLOB. `String()` would compare the
+  // comma-joined decimal digits instead, which orders [10] before [9].
+  if (a instanceof Uint8Array && b instanceof Uint8Array) {
+    const length = Math.min(a.length, b.length);
+    for (let i = 0; i < length; i += 1) {
+      if (a[i] !== b[i]) return (a[i] as number) - (b[i] as number);
+    }
+    return a.length - b.length;
+  }
   const left = String(a);
   const right = String(b);
   return left < right ? -1 : left > right ? 1 : 0;
-}
-
-/** Renders a stored value as text, the way a SQL LIKE coerces a non-text column. */
-function asText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value instanceof Date) return value.toISOString();
-  return String(value);
 }
 
 function valuesEqual(a: unknown, b: unknown): boolean {
@@ -190,7 +193,7 @@ function valueKey(value: unknown): string {
   if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') {
     return `${typeof value}:${value.toString()}`;
   }
-  /* c8 ignore next 2 -- unreachable: a json field is refused before a query reaches here */
+  /* c8 ignore next 2 -- unreachable: json and binary fields are refused before this point */
   return `json:${JSON.stringify(value)}`;
 }
 
@@ -337,6 +340,7 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
         `Unknown field "${field}" in where. Known fields: ${this.schema.fieldNames.join(', ')}`,
       );
     }
+    assertOperator(this.schema, field, op);
     if ((op === 'in' || op === 'nin') && !Array.isArray(filter.value)) {
       throw new QueryError(
         `Operator "${op}" on field "${field}" requires an array value, received ` +
@@ -399,7 +403,8 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
       case 'like':
       case 'ilike': {
         if (actual === null) return false;
-        return likeToRegExp(filter.value as string, op === 'ilike').test(asText(actual));
+        // Only a string field accepts a pattern, so the stored value is already text.
+        return likeToRegExp(filter.value as string, op === 'ilike').test(actual as string);
       }
 
       case 'isNull': {
@@ -432,6 +437,7 @@ export class MemoryRepo<T, ID = string> implements Repo<T, ID> {
             `${this.schema.fieldNames.join(', ')}`,
         );
       }
+      assertOrderable(this.schema, field, 'orderBy');
     }
 
     return [...rows].sort((left, right) => {

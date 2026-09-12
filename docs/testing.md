@@ -21,10 +21,14 @@ const service = new OrderService(repo);
 ```
 
 It is trustworthy for one reason only: it passes the same conformance suite as the real
-adapters. Filters, null ordering, `like` case sensitivity, unique constraints, transactions
-and savepoints, streaming, and keyset paging all behave the way a real engine behaves,
-because the suite fails if they do not. A fake that quietly diverges is worse than no fake,
-since the tests it passes stop meaning anything.
+adapters. Filters, null ordering, `like` case sensitivity, which operators each field type
+accepts, unique constraints, transactions and savepoints, streaming, and keyset paging all
+behave the way a real engine behaves, because the suite fails if they do not. A fake that
+quietly diverges is worse than no fake, since the tests it passes stop meaning anything.
+
+Bytes are copied on the way in and on the way out, as a real engine effectively does: once a
+`Uint8Array` has been written, mutating that array, or one a read handed back, cannot reach
+into the store and change the row behind the test's back.
 
 It is also the strongest evidence available that `QueryOptions` is not a SQL builder in
 disguise. Nothing in it compiles a string: filters are evaluated, ordering is a comparator,
@@ -88,6 +92,12 @@ runConformanceSuite({
 `createRepo` receives `{ schema, table, ids, timestamps }` and must honor all four. The suite
 generates a unique table name per test, tagged with a per-process random suffix, so two CI
 jobs pointed at the same server cannot collide.
+
+The schemas it passes use every field type, including `binary`, so an adapter has to store
+bytes and read them back as a plain `Uint8Array`: not a `Buffer`, and not a view onto more
+bytes than were written. An adapter built on `BaseRepo` gets this from `toDb` and `fromDb`
+already. The suite also asserts that an operator or sort a field's type does not support,
+such as `like` on a date, is refused with `QueryError` rather than passed to the engine.
 
 `unsupported` takes `'transactions'`, `'autoincrement'`, or `'introspection'`, each mapped to
 a reason string. Declaring one is a deliberate, visible statement rather than a quiet skip: an

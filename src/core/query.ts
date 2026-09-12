@@ -1,5 +1,6 @@
 import type { Dialect } from './dialect.js';
 import { QueryError } from './errors.js';
+import { assertOperator, assertOrderable } from './rules.js';
 import { columnFor, type FieldType, type Schema } from './schema.js';
 import { toDb } from './serialize.js';
 
@@ -127,6 +128,8 @@ function isOrGroup<T>(node: Filter<T>): node is OrGroup<T> {
  *  - `in` with an empty array is a constant false rather than invalid SQL, and `nin`
  *    with an empty array is a constant true.
  *  - `ne` and `nin` keep NULL rows in the result, which raw SQL would silently drop.
+ *  - An operator the field's type does not support everywhere, such as `like` on a number,
+ *    is refused here rather than left for one engine to reject and another to answer.
  *  - The column always comes from the schema and the value is always a bound parameter,
  *    so no caller-supplied text is ever interpolated into SQL.
  */
@@ -152,6 +155,7 @@ function compileFilter<T>(
   }
 
   const column = columnFor(schema, field, 'where', QueryError);
+  assertOperator(schema, field, op);
   const type = schema.types[field] as FieldType;
   const bind = (value: unknown): string => params.add(toDb(value, type, dialect, field));
 
@@ -332,7 +336,9 @@ export function compileOrderBy<T>(
           `Expected "asc" or "desc".`,
       );
     }
-    return { expr: columnFor(schema, field, 'orderBy', QueryError), direction };
+    const expr = columnFor(schema, field, 'orderBy', QueryError);
+    assertOrderable(schema, field, 'orderBy');
+    return { expr, direction };
   });
 
   return orderByClause(terms, dialect);

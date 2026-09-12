@@ -10,6 +10,7 @@ import {
   type OrderTerm,
   type QueryOptions,
 } from './query.js';
+import { assertGroupable, TYPE_RULES } from './rules.js';
 import { columnFor, type FieldType, type Schema } from './schema.js';
 import { fromDb, toDb } from './serialize.js';
 
@@ -97,29 +98,6 @@ const HAVING_OPERATORS = new Set<string>(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 
 /** Aliases are interpolated into SQL, so they are held to the same shape as a column name. */
 const ALIAS_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** What `sum` and `avg` accept. Averaging a date or a boolean is a mistake, not a feature. */
-const NUMERIC_TYPES = new Set<FieldType>(['number', 'integer']);
-
-/**
- * What `groupBy`, `distinct`, and `min`/`max` accept.
- *
- * `json` is excluded on purpose. Postgres stores it as `jsonb`, which compares and orders
- * normalized documents, while SQLite and MySQL store the exact text `toDb` produced and
- * compare that. Two engines would put the same rows in different groups, which is the one
- * thing this package exists to prevent. Group in application code, or store the part you
- * group by as its own column.
- */
-const GROUPABLE_TYPES = new Set<FieldType>(['string', 'number', 'integer', 'date', 'boolean']);
-
-/**
- * What `min` and `max` accept: the groupable types, less `boolean`.
- *
- * Postgres has no `min(boolean)` at all, while SQLite and MySQL store a boolean as 0 or 1
- * and will happily order it. Rejecting it here turns an error that only one engine would
- * have raised, at runtime, into the same `QueryError` everywhere.
- */
-const ORDERABLE_TYPES = new Set<FieldType>(['string', 'number', 'integer', 'date']);
-
 /** One resolved aggregate: the alias, what it computes, and the type it reads back as. */
 export interface AggregateTerm {
   alias: string;
@@ -167,17 +145,12 @@ export interface AggregatePlan {
   orderBy: AggregateOrderTerm[];
 }
 
-function assertGroupable(schema: Schema, field: string, context: string): GroupTerm {
+function planGroup(schema: Schema, field: string, context: string): GroupTerm {
   const column = columnFor(schema, field, context, QueryError);
-  const type = schema.types[field] as FieldType;
-  if (!GROUPABLE_TYPES.has(type)) {
-    throw new QueryError(
-      `Field "${field}" is declared ${type} and cannot be used in ${context}. Postgres ` +
-        `normalizes a json value and the other engines store it verbatim, so the engines ` +
-        `would not agree on which values are the same one.`,
-    );
-  }
-  return { field, column, type };
+  // Two engines putting the same rows in different groups is the one thing this package
+  // exists to prevent, so a type they compare differently cannot be a group key.
+  assertGroupable(schema, field, context);
+  return { field, column, type: schema.types[field] as FieldType };
 }
 
 /** Resolves and validates group keys, rejecting duplicates and unusable types. */
@@ -201,7 +174,7 @@ function planGroups(
       throw new QueryError(`Field "${field}" is named twice in ${context}.`);
     }
     seen.add(field);
-    groups.push(assertGroupable(schema, field, context));
+    groups.push(planGroup(schema, field, context));
   }
   return groups;
 }
@@ -245,18 +218,24 @@ function planTerm<T>(schema: Schema, alias: string, spec: Aggregate<T>): Aggrega
 
   const column = columnFor(schema, field, `aggregate "${alias}"`, QueryError);
   const type = schema.types[field] as FieldType;
+  const rules = TYPE_RULES[type];
 
-  if ((fn === 'sum' || fn === 'avg') && !NUMERIC_TYPES.has(type)) {
+  // Averaging a date or a boolean is a mistake, not a feature.
+  if ((fn === 'sum' || fn === 'avg') && !rules.numeric) {
     throw new QueryError(
       `Aggregate "${fn}" on alias "${alias}" needs a number or integer field, but "${field}" ` +
         `is declared ${type}.`,
     );
   }
-  if ((fn === 'min' || fn === 'max') && !ORDERABLE_TYPES.has(type)) {
+  if ((fn === 'min' || fn === 'max') && !rules.extremum) {
+    // Postgres has no `min(boolean)` at all, while SQLite and MySQL would happily order the
+    // 0 or 1 they store. Refusing it here turns an error only one engine would raise, at
+    // runtime, into the same `QueryError` everywhere.
+    const why = type === 'boolean' ? 'Postgres has no minimum or maximum of a boolean.' : rules.why;
     throw new QueryError(
       `Aggregate "${fn}" on alias "${alias}" cannot be taken over "${field}", which is ` +
-        `declared ${type}. Postgres has no minimum of a boolean and no engine-independent ` +
-        `ordering of a json value: group by the field instead, or compare in application code.`,
+        `declared ${type}. ${why ?? ''} Group by the field instead, or compare in application ` +
+        `code.`,
     );
   }
   if ((fn === 'min' || fn === 'max') && distinct) {
@@ -265,11 +244,10 @@ function planTerm<T>(schema: Schema, alias: string, spec: Aggregate<T>): Aggrega
         `and largest values of a set do not change when its duplicates are removed.`,
     );
   }
-  if (fn === 'count' && distinct && !GROUPABLE_TYPES.has(type)) {
+  if (fn === 'count' && distinct && !rules.groupable) {
     throw new QueryError(
       `Alias "${alias}" counts distinct values of "${field}", which is declared ${type}. ` +
-        `Only Postgres normalizes a json value, so the engines would not agree on how many ` +
-        `distinct ones there are.`,
+        `${rules.why ?? ''}`.trimEnd(),
     );
   }
 

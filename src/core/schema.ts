@@ -4,7 +4,7 @@ import { type RepoError, SchemaError } from './errors.js';
  * The storage types repolayer knows how to normalize across engines. Deliberately small:
  * anything exotic is better expressed as `json` than as a dialect-specific column type.
  */
-export type FieldType = 'string' | 'number' | 'integer' | 'boolean' | 'date' | 'json';
+export type FieldType = 'string' | 'number' | 'integer' | 'boolean' | 'date' | 'json' | 'binary';
 
 export interface FieldDef {
   type: FieldType;
@@ -28,7 +28,9 @@ type FieldValue<F extends FieldDef> = F['type'] extends 'string'
       ? boolean
       : F['type'] extends 'date'
         ? Date
-        : unknown;
+        : F['type'] extends 'binary'
+          ? Uint8Array
+          : unknown;
 
 type Nullable<F extends FieldDef, V> = F extends { nullable: true } ? V | null : V;
 
@@ -64,7 +66,15 @@ export interface Schema<F extends FieldMap = any> {
   readonly types: Readonly<Record<string, FieldType>>;
 }
 
-const VALID_TYPES = new Set<string>(['string', 'number', 'integer', 'boolean', 'date', 'json']);
+const VALID_TYPES = new Set<string>([
+  'string',
+  'number',
+  'integer',
+  'boolean',
+  'date',
+  'json',
+  'binary',
+]);
 
 /**
  * Validates a field map and precomputes the lookup tables both adapters use.
@@ -117,7 +127,21 @@ export function defineSchema<const F extends FieldMap>(fields: F): Schema<F> {
       if (def.nullable) {
         throw new SchemaError(`Primary key "${name}" cannot be nullable`);
       }
+      if (def.type === 'binary') {
+        throw new SchemaError(
+          `Primary key "${name}" cannot be binary. MySQL cannot key a BLOB, and a page cursor ` +
+            `has no portable encoding for one. Use a string key, such as the hex of the bytes.`,
+        );
+      }
       primaryKey = name;
+    }
+
+    if (def.type === 'binary' && def.default !== undefined) {
+      throw new SchemaError(
+        `Field "${name}" is binary and declares a default. Every engine spells a byte literal ` +
+          `differently and MySQL gives a BLOB no literal default at all, so set the value on ` +
+          `create instead.`,
+      );
     }
 
     columns[name] = column;

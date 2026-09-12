@@ -13,9 +13,10 @@ import type { FieldType, Schema } from './schema.js';
  *   boolean   INTEGER 0/1                       BOOLEAN            TINYINT(1) 0/1
  *   date      TEXT, ISO-8601 UTC, fixed width   TIMESTAMPTZ        DATETIME(6), UTC
  *   json      TEXT via JSON.stringify           JSONB              LONGTEXT
+ *   binary    BLOB                              BYTEA              LONGBLOB / VARBINARY
  *
  * Application code never sees the difference: `toDb`/`fromDb` round trip real `Date`
- * objects, real booleans, and real numbers on both engines.
+ * objects, real booleans, real numbers, and plain `Uint8Array`s on every engine.
  */
 
 function fail(field: string, type: FieldType, value: unknown): never {
@@ -26,6 +27,7 @@ function describe(value: unknown): string {
   if (value === null) return 'null';
   if (value === undefined) return 'undefined';
   if (value instanceof Date) return 'a Date';
+  if (ArrayBuffer.isView(value)) return 'binary data';
   if (Array.isArray(value)) return 'an array';
   return `a ${typeof value}`;
 }
@@ -75,6 +77,18 @@ export function toDb(value: unknown, type: FieldType, dialect: Dialect, field: s
       // Always stringify ourselves. Letting the driver infer would send a bare string
       // value as text, which Postgres then refuses to cast to jsonb.
       return JSON.stringify(value ?? null);
+
+    case 'binary':
+      if (!(value instanceof Uint8Array)) fail(field, type, value);
+      // node:sqlite binds a Uint8Array as a BLOB directly.
+      if (dialect === 'sqlite') return value;
+      // A copy, so a caller reusing its buffer after `create` cannot rewrite a stored row.
+      if (dialect === 'memory') return new Uint8Array(value);
+      // A Buffer is the form pg and mysql2 both document for bytes, across the whole peer
+      // version range, rather than relying on each release also recognizing a plain
+      // Uint8Array. The view keeps the offset and length, so a `subarray()` binds only its
+      // own bytes rather than the whole backing buffer, and nothing is copied.
+      return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   }
 }
 
@@ -109,7 +123,30 @@ export function fromDb(value: unknown, type: FieldType, dialect: Dialect, field:
       // Parsing the Postgres result again would corrupt a legitimately stored string.
       if (dialect === 'postgres') return value;
       return typeof value === 'string' ? JSON.parse(value) : value;
+
+    case 'binary':
+      return toBytes(value, dialect, field);
   }
+}
+
+/**
+ * Normalizes whatever a driver hands back for a byte column into a plain `Uint8Array`.
+ *
+ * pg and mysql2 return a `Buffer` and node:sqlite a `Uint8Array`. A `Buffer` is a subclass,
+ * but it serializes to JSON differently and fails a strict equality check against a plain
+ * array, so returning it would make one engine's rows compare unequal to another's. The
+ * view shares the driver's memory rather than copying it. `MemoryRepo` copies instead,
+ * because its store would otherwise be reachable from every row it returns.
+ */
+function toBytes(value: unknown, dialect: Dialect, field: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new QueryError(
+      `Field "${field}" is declared binary but the driver returned ${describe(value)}`,
+    );
+  }
+  if (dialect === 'memory') return new Uint8Array(value);
+  if (Object.getPrototypeOf(value) === Uint8Array.prototype) return value;
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }
 
 /** "2024-03-05T06:07:08.123Z" becomes "2024-03-05 06:07:08.123", which is what DATETIME wants. */

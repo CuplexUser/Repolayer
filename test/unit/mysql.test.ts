@@ -197,6 +197,20 @@ describe('mysql ddl', () => {
     expect(sql).toMatch(/name TEXT/);
   });
 
+  it('uses VARBINARY where a binary column has to be indexable and LONGBLOB otherwise', () => {
+    // No prefix index on a BLOB, and never BINARY(n), which pads a value with zero bytes.
+    const bytes = defineSchema({
+      id: { type: 'string', primaryKey: true },
+      digest: { type: 'binary', unique: true },
+      body: { type: 'binary', nullable: true },
+    });
+    const [sql] = createTableStatements(bytes, 't', 'mysql');
+    expect(sql).toContain('digest VARBINARY(255) NOT NULL UNIQUE');
+    expect(sql).toMatch(/body LONGBLOB\n/);
+    // Bytes have no character set to get wrong.
+    expect(sql).not.toMatch(/(digest|body) [^\n]*utf8mb4/);
+  });
+
   it('uses AUTO_INCREMENT for a generated key', () => {
     const numeric = defineSchema({
       id: { type: 'integer', primaryKey: true },

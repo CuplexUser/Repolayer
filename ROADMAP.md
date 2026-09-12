@@ -29,6 +29,16 @@ has, so every adapter built on it gains both methods and compiles untouched. Onl
 adapter that implements the bare `Repo<T>` interface from scratch has to add them, which is
 what `MemoryRepo` did here.
 
+Binary data and the type rules land in `2.2.0`, a minor bump under the same rule: `BaseRepo`
+grew no abstract member and no signature changed, so an adapter built on it compiles
+untouched and gains `binary` through `toDb` and `fromDb`. Two things are worth knowing when
+upgrading all the same. `FieldType` grew a member, so an exhaustive `switch` or a
+`Record<FieldType, …>` in adapter code needs one new case. And a query that one engine
+happened to answer, such as `like` on a date column on SQLite, now throws `QueryError`
+everywhere, because another engine never answered it the same way. That query was never
+portable; this release makes it fail on the engine you develop against instead of the one you
+deploy to.
+
 ## Shipped
 
 ### The contract
@@ -122,6 +132,24 @@ Validation and name resolution live in `planAggregate`, which renders no SQL, so
 legal. On MySQL, string grouping follows the column's collation: `ensureTable` creates
 string columns `utf8mb4_bin` for exactly this reason, and `verifyTable()` reports a table
 that was created some other way.
+
+### Binary data and type rules
+
+A `binary` field type, read and written as a `Uint8Array` on every engine: `BLOB` on SQLite,
+`BYTEA` on Postgres, `LONGBLOB` on MySQL, or `VARBINARY(255)` where it is unique. pg and mysql2
+hand back a `Buffer`, and it is returned as a plain `Uint8Array` over the same memory, so a
+row read from one engine compares equal to the same row read from another.
+
+It supports equality and null checks only: `eq`, `ne`, `in`, `nin`, `isNull`, and `unique`.
+That covers hashes, tokens, and stored files, and it is all the conformance suite proves so
+far. A binary field cannot be the primary key or carry a DDL default.
+
+Adding it surfaced a gap that had nothing to do with bytes: nothing checked an operator
+against the type of the field it was applied to. `like` on an integer matched stored text on
+SQLite and `MemoryRepo` and was a driver error on Postgres, and ordering a json field compared
+`jsonb` documents on Postgres and text everywhere else. What each type allows now lives in
+one table, `TYPE_RULES` in `src/core/rules.ts`, which the compiler, the aggregate planner,
+keyset paging, and `MemoryRepo` all read, so none of them can grow a separate opinion.
 
 ### MySQL and MariaDB, in detail
 
@@ -219,6 +247,10 @@ publishing, not a reason to loosen the suite.
 
 ## Later
 
+- Ordering and grouping for `binary`. Every engine compares bytes the same way, byte by byte
+  with a shorter prefix first, so range operators, `orderBy`, and `groupBy` look portable.
+  They need conformance cases before the rule allows them, and `min`/`max` would stay refused
+  because Postgres has no `min(bytea)`.
 - Further adapters: Cloudflare D1, libSQL/Turso, and an HTTP adapter, once the suite is
   proven to be a sufficient contract for adapters written by other people.
 - A server-side streaming path for MySQL. `mysql2` can stream, but only through its

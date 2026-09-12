@@ -45,6 +45,7 @@ const puzzleSchema = defineSchema({
   difficulty: { type: 'integer' },
   solved:     { type: 'boolean' },
   tags:       { type: 'json',    nullable: true },
+  thumbnail:  { type: 'binary',  nullable: true },
   createdAt:  { type: 'date',    column: 'created_at' },
   updatedAt:  { type: 'date',    column: 'updated_at' },
 });
@@ -115,7 +116,7 @@ same way, and it is why the abstraction can hold.
 ## Documentation
 
 - [API](docs/api.md) - every export, method by method
-- [Queries](docs/queries.md) - filters, filter trees, operators, ordering, limits, grouping
+- [Queries](docs/queries.md) - filters, filter trees, operators by type, ordering, limits, grouping
 - [Streaming and paging](docs/streaming.md) - cursors, cancellation, keyset pagination
 - [Engines](docs/engines.md) - what is normalized, what differs, MySQL and MariaDB specifics
 - [Testing](docs/testing.md) - `MemoryRepo`, and the conformance suite for adapter authors

@@ -19,6 +19,7 @@ shape is what lets four very different engines behave the same way.
 - [`where`](#where)
 - [Filter trees](#filter-trees)
 - [Operators](#operators)
+- [Operators by type](#operators-by-type)
 - [`orderBy`](#orderby)
 - [`limit` and `offset`](#limit-and-offset)
 - [Aggregation and `groupBy`](#aggregation-and-groupby)
@@ -93,6 +94,33 @@ from a request, and an unbounded tree would compile to unbounded SQL.
 case insensitive for ASCII by default, Postgres's is not, and MySQL's depends on the column
 collation. See [engines.md](engines.md) for how that is normalized, and for the one place
 where comparing a whole `json` value differs.
+
+## Operators by type
+
+Not every operator means the same thing on every type, and where the engines would disagree
+the query is refused with a `QueryError` before it reaches any of them.
+
+| type | filter operators | `orderBy`, `findPage` | `groupBy`, `distinct` | `min` / `max` | `sum` / `avg` |
+|---|---|---|---|---|---|
+| `string` | all eleven | yes | yes | yes | no |
+| `number`, `integer` | all but `like` and `ilike` | yes | yes | yes | yes |
+| `boolean` | all but `like` and `ilike` | yes | yes | no | no |
+| `date` | all but `like` and `ilike` | yes | yes | yes | no |
+| `json` | `eq`, `ne`, `in`, `nin`, `isNull` | no | no | no | no |
+| `binary` | `eq`, `ne`, `in`, `nin`, `isNull` | no | no | no | no |
+
+The reasons, in order of how often they come up:
+
+- **A pattern only matches text.** SQLite stores a date as ISO text and would match
+  `createdAt like '2024-%'`, while Postgres refuses to apply LIKE to a timestamp at all. Filter
+  a date with `gte` and `lt` instead, which every engine answers the same way.
+- **A `json` value has no order the engines share.** Postgres compares `jsonb` documents
+  structurally and SQLite and MySQL compare the stored text, so they would sort and group the
+  same rows differently. Sort by a column that holds the part you care about.
+- **Postgres has no `min` or `max` of a boolean.** Order by the field, or count per value with
+  `groupBy`.
+- **`binary` supports equality only, for now.** Two values are equal when every byte matches,
+  so `[1, 2]` and `[1, 2, 0]` are different values on every engine.
 
 ## `orderBy`
 
@@ -214,14 +242,16 @@ A query that cannot be compiled throws `QueryError`, always before any SQL reach
 database:
 
 - a `field` that is not in the schema
-- an `op` that is not one of the eleven operators
+- an `op` that is not one of the eleven operators, or one the field's type does not support
+  (see [Operators by type](#operators-by-type)), such as `like` on a number or a date
+- an `orderBy` or `findPage` sort on a `json` or `binary` field
 - `in` or `nin` with a value that is not an array
 - a value that cannot be serialized to the field's declared type
 - a `limit` or `offset` that is negative or not an integer
 - a filter tree deeper than 16 levels
 - an aggregate no engine could answer identically: summing or averaging anything but a number
-  or an integer, a `min` or `max` over a `boolean` (Postgres has none) or a `json` value, and
-  grouping, counting distinct, or `distinct` on a `json` field
+  or an integer, a `min` or `max` over a `boolean` (Postgres has none), a `json` value, or a
+  `binary` value, and grouping, counting distinct, or `distinct` on a `json` or `binary` field
 - an aggregate alias that is not a plain identifier, or two names in one grouped result that
   differ only in case
 - a `having` that names a column rather than an aggregate alias, and an aggregate `orderBy`

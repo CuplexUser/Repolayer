@@ -80,6 +80,10 @@ Three details the implementation insists on:
   `orderBy`, and using it under a different one throws rather than paging wrongly.
 - **Tokens carry a version.** One minted by an older deployment fails loudly instead of being
   misread.
+- **Every sort key needs an order the engines share.** A `json` or `binary` field is refused
+  as a sort key, here and in `orderBy` everywhere else, because a cursor compared against an
+  order one engine defines differently would skip or repeat rows. See
+  [queries.md](queries.md#operators-by-type).
 
 `findPage` rejects an `offset`, because mixing the two is always a mistake.
 

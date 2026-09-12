@@ -27,6 +27,13 @@ A new adapter is not a fork of an existing one: implement `Repo<T>`, run
 [the suite](testing.md#the-conformance-suite), and declare anything the engine genuinely
 cannot do.
 
+What each field type may be filtered, sorted, grouped, and aggregated by lives in one table,
+`TYPE_RULES` in `src/core/rules.ts`, and the compiler, the aggregate planner, keyset paging,
+and `MemoryRepo` all read it. Adding a field type means adding its row there, which the type
+checker insists on, alongside its storage in `serialize.ts`, `ddl.ts`, and `introspect.ts`.
+Widening a row, such as letting `binary` be ordered, needs conformance cases proving every
+engine agrees first: flipping the flag alone proves nothing.
+
 ## Examples
 
 Each one runs standalone, against SQLite unless it says otherwise.
